@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -106,19 +107,17 @@ class WeiboPdfExporter:
     def export_user_timeline(
         self,
         user_id: str,
-        output_path: Path | str,
+        output_path: Path | str | None,
         font_path: Optional[Path | str] = None,
     ) -> Path:
         """
         Export timeline and comments of one user into a PDF file.
 
         :param user_id: weibo user id
-        :param output_path: target pdf path
+        :param output_path: target pdf path; if None, auto-generate under weibo/ directory
         :param font_path: optional TTF font path for CJK text
         :return: Path to the generated pdf
         """
-        output_path = Path(output_path)
-
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             user = self._load_user(conn, user_id)
@@ -127,8 +126,38 @@ class WeiboPdfExporter:
 
             weibos = self._load_weibos_with_comments(conn, user_id)
 
+        if output_path is None:
+            output_path = self._build_default_output_path(user, weibos)
+
+        output_path = Path(output_path)
         self._build_pdf(user, weibos, output_path, font_path)
         return output_path
+
+    def _build_default_output_path(
+        self, user: UserProfile, weibos: List[WeiboPost]
+    ) -> Path:
+        """
+        Build default PDF path: weibo/<nick_name>_<start_date>_<end_date>.pdf
+        Dates are derived from the actual weibo data range.
+        """
+        weibo_dir = BASE_DIR / "weibo"
+        weibo_dir.mkdir(exist_ok=True)
+
+        nick = user.nick_name or user.id
+        safe_nick = re.sub(r'[\\/:*?"<>|]', "_", str(nick))
+
+        if weibos:
+            dates = [w.created_at for w in weibos if isinstance(w.created_at, datetime)]
+            if dates:
+                start_str = min(dates).strftime("%Y-%m-%d")
+                end_str = max(dates).strftime("%Y-%m-%d")
+            else:
+                start_str = end_str = "unknown"
+        else:
+            start_str = end_str = "unknown"
+
+        filename = f"{safe_nick}_{start_str}_{end_str}.pdf"
+        return weibo_dir / filename
 
     # --- data access --------------------------------------------------------
 
@@ -415,7 +444,12 @@ if __name__ == "__main__":
         description="Export one user's weibo timeline and comments to PDF."
     )
     parser.add_argument("user_id", help="weibo user id stored in SQLite")
-    parser.add_argument("output", help="output pdf path")
+    parser.add_argument(
+        "output",
+        nargs="?",
+        help="output pdf path (optional, default: weibo/<nick>_<start>_<end>.pdf)",
+        default=None,
+    )
     parser.add_argument(
         "--db",
         help=f"SQLite database path (default: {DEFAULT_DB_PATH})",
