@@ -2470,6 +2470,7 @@ def handle_config_renaming(config, oldName, newName):
         config[newName] = config[oldName]
         del config[oldName]
 
+
 def get_config():
     """获取config.json文件信息"""
     config_path = os.path.split(os.path.realpath(__file__))[0] + os.sep + "config.json"
@@ -2485,6 +2486,22 @@ def get_config():
             # 重命名一些key, 但向前兼容
             handle_config_renaming(config, oldName="filter", newName="only_crawl_original")
             handle_config_renaming(config, oldName="result_dir_name", newName="user_id_as_folder_name")
+
+            # 使用 config.json 中的通知配置覆盖 const.NOTIFY
+            # 支持的结构示例：
+            # "notify": {
+            #   "enable": true,
+            #   "push_key": "your_pushdeer_key"
+            # }
+            notify_cfg = config.get("notify") or config.get("NOTIFY")
+            if isinstance(notify_cfg, dict):
+                if "enable" in notify_cfg:
+                    const.NOTIFY["NOTIFY"] = bool(notify_cfg.get("enable"))
+                if "PUSH_KEY" in notify_cfg:
+                    const.NOTIFY["PUSH_KEY"] = notify_cfg.get("PUSH_KEY") or ""
+                if "push_key" in notify_cfg:
+                    const.NOTIFY["PUSH_KEY"] = notify_cfg.get("push_key") or const.NOTIFY["PUSH_KEY"]
+
             return config
     except ValueError:
         logger.error(

@@ -3,23 +3,23 @@
     "only_crawl_original": 0,
     "since_date": 1,
     "start_page": 1,
-    "page_weibo_count": 10,
+    "page_weibo_count": 100,
     "write_mode": [
-        "csv"
+        "csv","sqlite"
     ],
     "original_pic_download": 1,
-    "retweet_pic_download": 0,
+    "retweet_pic_download": 1,
     "original_video_download": 1,
-    "retweet_video_download": 0,
+    "retweet_video_download": 1,
     "original_live_photo_download": 1,
-    "retweet_live_photo_download": 0,
+    "retweet_live_photo_download": 1,
     "download_comment": 1,
-    "comment_max_download_count": 100,
+    "comment_max_download_count": 1000,
     "download_repost": 1,
-    "repost_max_download_count": 100,
+    "repost_max_download_count": 1000,
     "user_id_as_folder_name": 0,
     "remove_html_tag": 1,
-    "cookie": "your cookie",
+    "cookie": "_T_WM=c4d93eff0216a702c723b50ac41dc30a; ALF=1766568896; SCF=AnF8LWUY2ePVt9IwohTNIy1wfxZ1zU_PMjG3nzW-Jh_Fbl6khf1cI6fxVRkwCxiSWBcJgRP6GCstDD2ypbIfTBc.; SSOLoginState=1763976896; SUB=_2A25EIFbvDeRhGeFK4lAV-C7PzDyIHXVnXNYnrDV6PUJbktAbLVTbkW1NQtJhP4jihoJH4u9rCwlhTiNpCyfhouv9; SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9Wh24ShvaxLWM2YTDLl63wSM5JpX5KzhUgL.FoMX1KzX1h50S052dJLoIp7LxKML1KBLBKnLxKqL1hnLBoMNSKMEShqXe02E",
     "mysql_config": {
         "host": "localhost",
         "port": 3306,
@@ -32,5 +32,9 @@
     "post_config": {
         "api_url": "https://api.example.com",
         "api_token": ""
+    },
+    "notify": {
+        "enable": false,
+        "push_key": ""
     }
 }
