@@ -8,12 +8,13 @@ Features:
 - Reads user, weibo and comment data from weibodata.db
 - Weibo groups sorted by publish time (newest -> oldest)
 - Each group: one weibo paragraph followed by its comments
-- Comments sorted by publish time (oldest -> newest)
+- Comments sorted by like_count (highest -> lowest), limited by config
 - First page contains basic user profile information
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -57,6 +58,7 @@ class Comment:
     created_at: Optional[datetime]
     user_screen_name: str
     text: str
+    like_count: int
 
 
 @dataclass
@@ -70,10 +72,34 @@ class WeiboPost:
 class WeiboPdfExporter:
     """Export one user's timeline with comments into a PDF."""
 
-    def __init__(self, db_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        comment_limit: Optional[int] = None,
+    ) -> None:
         self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
         if not self.db_path.exists():
             raise FileNotFoundError(f"SQLite database not found: {self.db_path}")
+        # 控制每条微博写入 PDF 的评论数量，优先使用传入参数，否则读取 config.json 中的 comment_by_like_count
+        self.comment_limit = self._load_comment_limit(comment_limit)
+
+    def _load_comment_limit(self, override: Optional[int]) -> int:
+        """Resolve comment limit from explicit arg or config.json, fallback to 10."""
+        if isinstance(override, int) and override > 0:
+            return override
+
+        config_path = BASE_DIR / "config.json"
+        try:
+            with config_path.open(encoding="utf-8") as f:
+                cfg = json.load(f)
+            value = cfg.get("comment_by_like_count")
+            if isinstance(value, int) and value > 0:
+                return value
+        except Exception:
+            # On any error (missing file, bad json, missing key), fall back to default
+            pass
+
+        return 10
 
     # --- public API ---------------------------------------------------------
 
@@ -172,7 +198,7 @@ class WeiboPdfExporter:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, created_at, user_screen_name, text
+            SELECT id, created_at, user_screen_name, text, like_count
             FROM comments
             WHERE weibo_id = ?
             """,
@@ -191,11 +217,20 @@ class WeiboPdfExporter:
                     created_at=dt,
                     user_screen_name=row["user_screen_name"] or "",
                     text=row["text"] or "",
+                    like_count=row["like_count"] or 0,
                 )
             )
 
-        # sort comments by publish time (oldest -> newest)
-        comments.sort(key=lambda c: (c.created_at or datetime.min, c.id))
+        # sort comments by like_count descending, then by time/id for stable ordering
+        comments.sort(
+            key=lambda c: (-c.like_count, c.created_at or datetime.min, c.id)
+        )
+
+        # limit number of comments written into PDF for each weibo
+        limit = self.comment_limit
+        if isinstance(limit, int) and limit > 0:
+            comments = comments[:limit]
+
         return comments
 
     @staticmethod
