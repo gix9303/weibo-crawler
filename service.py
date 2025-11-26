@@ -128,34 +128,20 @@ def get_config(user_id_list=None):
 def _extract_user_ids_from_config(config: dict) -> list[str]:
     """
     从配置中解析用户ID列表：
-    - 如果 user_id_list 是 list，直接返回其中的字符串形式
-    - 如果是 txt 路径，则读取文件并解析每行首个数字字段作为 user_id
-    - 如果是单个 id 字符串，返回单元素列表
+    - 现在只支持 user_id_list 为 list[dict] 或 list[简单ID]
     """
     raw = config.get("user_id_list")
     ids: list[str] = []
     if isinstance(raw, list):
-        ids = [str(x).strip() for x in raw if str(x).strip()]
-    elif isinstance(raw, str):
-        s = raw.strip()
-        if s.endswith(".txt"):
-            txt_path = s
-            if not os.path.isabs(txt_path):
-                txt_path = os.path.join(
-                    os.path.split(os.path.realpath(__file__))[0], txt_path
-                )
-            try:
-                with open(txt_path, "rb") as f:
-                    lines = f.read().splitlines()
-                    lines = [line.decode("utf-8-sig") for line in lines]
-                for line in lines:
-                    parts = line.strip().split(" ")
-                    if parts and parts[0].isdigit():
-                        ids.append(parts[0])
-            except Exception as e:
-                logger.warning("从 %s 解析 user_id_list 失败: %s", txt_path, e)
-        elif s:
-            ids = [s]
+        for item in raw:
+            if isinstance(item, dict):
+                uid = str(item.get("user_id") or item.get("id") or "").strip()
+                if uid:
+                    ids.append(uid)
+            else:
+                s = str(item).strip()
+                if s:
+                    ids.append(s)
     return ids
 
 
@@ -205,12 +191,37 @@ def run_refresh_task(task_id, user_id_list=None):
         
         wb.start()  # 爬取微博信息
 
-        # 爬取完成后，更新 config.json 中的 end_date 为当前系统时间
+        # 爬取完成后，同步 dict 形式 user_id_list 的 per-user since/end
         try:
             config_path = os.path.join(os.path.split(os.path.realpath(__file__))[0], "config.json")
             with open(config_path, "r", encoding="utf-8") as f:
                 latest_cfg = json.load(f)
-            latest_cfg["end_date"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # 如果 config.json 中 user_id_list 是 list[dict]，则将 Weibo 内部更新后的
+            # 每个用户的 since_date / end_date 写回 config.json
+            try:
+                ul = latest_cfg.get("user_id_list")
+                if isinstance(ul, list) and ul and isinstance(ul[0], dict):
+                    # 构建 user_id -> per-user 配置 的映射
+                    per_user = {}
+                    for u_cfg in wb.user_config_list:
+                        uid = str(u_cfg.get("user_id") or u_cfg.get("id") or "").strip()
+                        if uid:
+                            per_user[uid] = u_cfg
+
+                    for entry in ul:
+                        uid = str(entry.get("user_id") or entry.get("id") or "").strip()
+                        if not uid:
+                            continue
+                        u_cfg = per_user.get(uid)
+                        if not u_cfg:
+                            continue
+                        if u_cfg.get("since_date"):
+                            entry["since_date"] = u_cfg["since_date"]
+                        if u_cfg.get("end_date"):
+                            entry["end_date"] = u_cfg["end_date"]
+            except Exception as per_err:
+                logger.warning("同步 config.json 中 user_id_list per-user 时间失败: %s", per_err)
+
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(latest_cfg, f, ensure_ascii=False, indent=4)
         except Exception as cfg_err:
@@ -262,48 +273,35 @@ def refresh():
         try:
             cfg = load_config_from_file()
         except SystemExit:
-            # load_config_from_file 内部可能会因格式错误退出，这里做保护
             cfg = {}
         except Exception:
             cfg = {}
 
-        # user_id_list 在界面上只展示为逗号分隔的用户ID：
-        # - 如果 config.json 中是 list，则直接 join
-        # - 如果是 txt 路径，则读取文件，取每行首个数字字段作为用户ID
-        # - 否则原样展示
-        raw_user_id_list = cfg.get("user_id_list", "")
-        user_id_list_val = ""
+        raw_user_id_list = cfg.get("user_id_list") or []
+        rows_html = ""
         if isinstance(raw_user_id_list, list):
-            user_id_list_val = ",".join(
-                str(x).strip() for x in raw_user_id_list if str(x).strip()
-            )
-        elif isinstance(raw_user_id_list, str):
-            s = raw_user_id_list.strip()
-            if s.endswith(".txt"):
-                txt_path = s
-                if not os.path.isabs(txt_path):
-                    txt_path = os.path.join(
-                        os.path.split(os.path.realpath(__file__))[0], txt_path
-                    )
-                ids = []
-                try:
-                    with open(txt_path, "rb") as f:
-                        lines = f.read().splitlines()
-                        lines = [line.decode("utf-8-sig") for line in lines]
-                    for line in lines:
-                        parts = line.strip().split(" ")
-                        if parts and parts[0].isdigit():
-                            ids.append(parts[0])
-                except Exception as e:
-                    logger.warning("读取 user_id_list 配置文件 %s 失败: %s", txt_path, e)
-                if ids:
-                    user_id_list_val = ",".join(ids)
+            for item in raw_user_id_list:
+                if isinstance(item, dict):
+                    uid = str(item.get("user_id") or item.get("id") or "").strip()
+                    name = str(item.get("screen_name") or item.get("nick_name") or "").strip()
+                    since = str(item.get("since_date") or "").strip()
+                    end = str(item.get("end_date") or "").strip()
                 else:
-                    user_id_list_val = ""
-            else:
-                user_id_list_val = s
-        since_date_val = cfg.get("since_date", "")
-        end_date_val = cfg.get("end_date", "")
+                    uid = str(item).strip()
+                    name = ""
+                    since = ""
+                    end = ""
+                if not uid and not name and not since and not end:
+                    continue
+                rows_html += f"""
+                <tr>
+                  <td><input type="text" name="user_id" style="width:120px;" value="{escape(uid)}" /></td>
+                  <td><input type="text" name="screen_name" style="width:160px;" value="{escape(name)}" /></td>
+                  <td><input type="text" name="since_date" style="width:180px;" value="{escape(since)}" /></td>
+                  <td><input type="text" name="end_date" style="width:180px;" value="{escape(end)}" /></td>
+                  <td><button type="button" onclick="removeUserRow(this)">删除</button></td>
+                </tr>
+                """
         cookie_val = cfg.get("cookie", "")
         notify_cfg = cfg.get("notify") or {}
         notify_enable_val = bool(notify_cfg.get("enable", False))
@@ -323,39 +321,47 @@ def refresh():
                   if (!cb) return;
                   div.style.display = cb.checked ? 'inline-block' : 'none';
               }}
+
+              function addUserRow() {{
+                  var tbody = document.getElementById('user_table_body');
+                  var tr = document.createElement('tr');
+                  tr.innerHTML = ''
+                    + '<td><input type="text" name="user_id" style="width:120px;" /></td>'
+                    + '<td><input type="text" name="screen_name" style="width:160px;" /></td>'
+                    + '<td><input type="text" name="since_date" style="width:180px;" /></td>'
+                    + '<td><input type="text" name="end_date" style="width:180px;" /></td>'
+                    + '<td><button type="button" onclick="removeUserRow(this)">删除</button></td>';
+                  tbody.appendChild(tr);
+              }}
+
+              function removeUserRow(btn) {{
+                  var tr = btn.parentNode.parentNode;
+                  tr.parentNode.removeChild(tr);
+              }}
             </script>
           </head>
           <body onload="togglePushKey()">
             <h1>刷新任务（配置编辑）</h1>
             <form method="post" action="/refresh">
+              <h2>用户列表</h2>
               <table border="1" cellspacing="0" cellpadding="4">
-                <tr>
-                  <th>user_id_list</th>
-                  <td>
-                    <input type="text" name="user_id_list" style="width:400px;"
-                           value="{escape(str(user_id_list_val))}" />
-                    <br/>
-                    <small>只填写用户 ID，多个用英文逗号分隔，例如：111,222,333。</small>
-                  </td>
-                </tr>
-                <tr>
-                  <th>since_date</th>
-                  <td>
-                    <input type="text" name="since_date" style="width:400px;"
-                           value="{escape(str(since_date_val))}" />
-                    <br/>
-                    <small>支持整数（天数）、yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS。</small>
-                  </td>
-                </tr>
-                <tr>
-                  <th>end_date</th>
-                  <td>
-                    <input type="text" name="end_date" style="width:400px;"
-                           value="{escape(str(end_date_val))}" />
-                    <br/>
-                    <small>系统会在爬取完成后自动写入当前时间（yyyy-mm-ddTHH:MM:SS）。</small>
-                  </td>
-                </tr>
+                <thead>
+                  <tr>
+                    <th>用户ID</th>
+                    <th>昵称</th>
+                    <th>since_date</th>
+                    <th>end_date</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="user_table_body">
+                  {rows_html}
+                </tbody>
+              </table>
+              <button type="button" onclick="addUserRow()">新增用户</button>
+
+              <h2>其他配置</h2>
+              <table border="1" cellspacing="0" cellpadding="4">
                 <tr>
                   <th>cookie</th>
                   <td>
@@ -378,6 +384,7 @@ def refresh():
                   </td>
                 </tr>
               </table>
+
               <br/>
               <button type="submit">保存配置并启动任务</button>
             </form>
@@ -399,26 +406,41 @@ def refresh():
         form = request.form
 
         # 更新关键字段
-        user_id_list_val = form.get("user_id_list", "").strip()
-        since_date_val = form.get("since_date", "").strip()
-        end_date_val = form.get("end_date", "").strip()
+        # 1) 解析用户列表（多行）
+        user_ids = form.getlist("user_id")
+        screen_names = form.getlist("screen_name")
+        since_dates = form.getlist("since_date")
+        end_dates = form.getlist("end_date")
+
+        new_user_list = []
+        for idx, uid in enumerate(user_ids):
+            uid = (uid or "").strip()
+            name = (screen_names[idx] if idx < len(screen_names) else "").strip()
+            sdate = (since_dates[idx] if idx < len(since_dates) else "").strip()
+            edate = (end_dates[idx] if idx < len(end_dates) else "").strip()
+            # 跳过完全空的一行
+            if not uid and not name and not sdate and not edate:
+                continue
+            # user_id 必须存在且为数字
+            if not uid.isdigit():
+                return f"第 {idx+1} 行 user_id 非数字，请检查", 400
+            entry = {"user_id": uid}
+            if name:
+                entry["screen_name"] = name
+            if sdate:
+                entry["since_date"] = sdate
+            if edate:
+                entry["end_date"] = edate
+            new_user_list.append(entry)
+
+        if not new_user_list:
+            return "至少需要配置一个用户", 400
+
+        cfg["user_id_list"] = new_user_list
+
         cookie_val = form.get("cookie", "").strip()
         notify_enable_val = form.get("notify_enable") is not None
         notify_push_key_val = form.get("notify_push_key", "").strip()
-
-        # user_id_list 只允许填写用户ID，多个用英文逗号分隔。
-        # 如果填写，则解析为列表写入 config.json；如果留空，则保留原值（可能是 txt 路径）。
-        if user_id_list_val != "":
-            ids = [x.strip() for x in user_id_list_val.split(",") if x.strip()]
-            # 简单校验：都为数字
-            if not ids or not all(i.isdigit() for i in ids):
-                return "user_id_list 格式错误，只能填写数字ID，多个用英文逗号分隔，例如：111,222,333", 400
-            cfg["user_id_list"] = ids
-        if since_date_val != "":
-            cfg["since_date"] = since_date_val
-        if end_date_val != "":
-            cfg["end_date"] = end_date_val
-        # 如果 end_date 为空，保留旧值；系统会在任务完成后自动写入当前时间
 
         cfg["cookie"] = cookie_val
 

@@ -1,8 +1,13 @@
 {
-    "user_id_list": "user_id_list.txt",
+    "user_id_list": [
+        {
+            "user_id": "6067225218",
+            "screen_name": "",
+            "since_date": "",
+            "end_date": ""
+        }
+    ],
     "only_crawl_original": 0,
-    "since_date": "",
-    "end_date": "",
     "start_page": 1,
     "page_weibo_count": 100,
     "write_mode": [
