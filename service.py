@@ -3,7 +3,7 @@ import const
 import logging
 import logging.config
 import os
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect
 import sqlite3
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -293,12 +293,27 @@ def refresh():
                     end = ""
                 if not uid and not name and not since and not end:
                     continue
+
+                # 将内部格式（可能包含时间）转换为 date 控件可用的 yyyy-mm-dd
+                since_display = ""
+                end_display = ""
+                if since:
+                    since_display = since.split("T")[0]
+                if end:
+                    end_display = end.split("T")[0]
+
                 rows_html += f"""
                 <tr>
-                  <td><input type="text" name="user_id" style="width:120px;" value="{escape(uid)}" /></td>
+                  <td><input type="text" name="user_id" style="width:120px;" 
+                             value="{escape(uid)}"
+                             placeholder="用户ID必填且为纯数字" /></td>
                   <td><input type="text" name="screen_name" style="width:160px;" value="{escape(name)}" /></td>
-                  <td><input type="text" name="since_date" style="width:180px;" value="{escape(since)}" /></td>
-                  <td><input type="text" name="end_date" style="width:180px;" value="{escape(end)}" /></td>
+                  <td><input type="text" name="since_date" style="width:180px;"
+                             value="{escape(since_display)}"
+                             placeholder="必填: yyyy-mm-dd" /></td>
+                  <td><input type="text" name="end_date" style="width:180px;"
+                             value="{escape(end_display)}"
+                             placeholder="默认为当前日期" /></td>
                   <td><button type="button" onclick="removeUserRow(this)">删除</button></td>
                 </tr>
                 """
@@ -326,10 +341,13 @@ def refresh():
                   var tbody = document.getElementById('user_table_body');
                   var tr = document.createElement('tr');
                   tr.innerHTML = ''
-                    + '<td><input type="text" name="user_id" style="width:120px;" /></td>'
+                    + '<td><input type="text" name="user_id" style="width:120px;" '
+                    + 'placeholder="用户ID必填且为纯数字" /></td>'
                     + '<td><input type="text" name="screen_name" style="width:160px;" /></td>'
-                    + '<td><input type="text" name="since_date" style="width:180px;" /></td>'
-                    + '<td><input type="text" name="end_date" style="width:180px;" /></td>'
+                    + '<td><input type="text" name="since_date" style="width:180px;" '
+                    + 'placeholder="必填: yyyy-mm-dd" /></td>'
+                    + '<td><input type="text" name="end_date" style="width:180px;" '
+                    + 'placeholder="默认为当前日期" /></td>'
                     + '<td><button type="button" onclick="removeUserRow(this)">删除</button></td>';
                   tbody.appendChild(tr);
               }}
@@ -386,7 +404,8 @@ def refresh():
               </table>
 
               <br/>
-              <button type="submit">保存配置并启动任务</button>
+              <button type="submit" name="action" value="save">仅保存配置</button>
+              <button type="submit" name="action" value="save_and_run">保存配置并启动任务</button>
             </form>
             <p><a href="/">返回首页</a></p>
           </body>
@@ -459,6 +478,12 @@ def refresh():
                 json.dump(cfg, f, ensure_ascii=False, indent=4)
         except Exception as e:
             return f"保存 config.json 失败: {e}", 500
+
+        # 根据按钮决定是否启动任务
+        action = form.get("action") or "save_and_run"
+        if action == "save":
+            # 仅保存配置，不启动任务，直接回到配置页
+            return redirect("/refresh")
 
         # 启动任务，使用最新 config.json 中的 user_id_list
         user_id_list = cfg.get("user_id_list")
@@ -834,40 +859,7 @@ def get_weibo_detail(weibo_id):
         logger.exception(e)
         return {"error": str(e)}, 500
 
-def schedule_refresh():
-    """定时刷新任务"""
-    while True:
-        try:
-            # 每轮调度时从 config.json 读取默认的 user_id_list
-            base_cfg = load_config_from_file()
-            default_user_ids = base_cfg.get('user_id_list') or []
-
-            # 检查是否有运行中的任务
-            running_task_id, running_task = get_running_task()
-            if not running_task:
-                task_id = str(uuid.uuid4())
-                tasks[task_id] = {
-                    'state': 'PENDING',
-                    'progress': 0,
-                    'created_at': datetime.now().isoformat(),
-                    'user_id_list': default_user_ids  # 使用 config.json 中的默认配置
-                }
-                with task_lock:
-                    global current_task_id
-                    current_task_id = task_id
-                executor.submit(run_refresh_task, task_id, default_user_ids)
-                logger.info(f"Scheduled task {task_id} started")
-            
-            time.sleep(600)  # 10分钟间隔
-        except Exception as e:
-            logger.exception("Schedule task error")
-            time.sleep(60)  # 发生错误时等待1分钟后重试
-
 if __name__ == "__main__":
-    # 启动定时任务线程
-    scheduler_thread = threading.Thread(target=schedule_refresh, daemon=True)
-    scheduler_thread.start()
-    
-    logger.info("服务启动")
+    logger.info("服务启动，仅提供 Web 管理界面，不自动启动爬虫任务")
     # 启动Flask应用
     app.run(debug=True, use_reloader=False)  # 关闭reloader避免启动两次

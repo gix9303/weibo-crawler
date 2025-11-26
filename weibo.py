@@ -176,9 +176,8 @@ class Weibo(object):
                 continue
             user_cfg = {
                 "user_id": uid,
-                "since_date": self._normalize_since_date(
-                    item.get("since_date")
-                ) if hasattr(self, "_normalize_since_date") else self.since_date,
+                # since_date 已在 validate_config 中验证为必填且格式正确，这里只做标准化
+                "since_date": self._normalize_since_date(item.get("since_date")),
                 "query_list": query_list,
             }
             # 可选昵称
@@ -241,7 +240,7 @@ class Weibo(object):
             logger.warning("append模式下请将sqlite加入write_mode中")
             sys.exit()
 
-        # 验证user_id_list：只支持 list[dict]
+        # 验证user_id_list：只支持 list[dict]，且每个用户必须有数字 user_id 和合法 since_date
         user_id_list = config["user_id_list"]
         if not isinstance(user_id_list, list) or not user_id_list:
             logger.warning("user_id_list值应为非空的list[dict]，例如 [{\"user_id\": \"123\"}, ...]")
@@ -253,6 +252,14 @@ class Weibo(object):
             uid = str(item.get("user_id") or item.get("id") or "").strip()
             if not uid or not uid.isdigit():
                 logger.warning("user_id_list 中的每个 dict 必须包含数字 user_id/id 字段")
+                sys.exit()
+            sdate = item.get("since_date")
+            if not isinstance(sdate, str) or not sdate.strip():
+                logger.warning("user_id_list 中每个用户必须指定 since_date（必填），支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS")
+                sys.exit()
+            token = sdate.strip()
+            if not (self.is_datetime(token) or self.is_date(token)):
+                logger.warning("since_date格式不正确，仅支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", token)
                 sys.exit()
 
         comment_max_count = config["comment_max_download_count"]
@@ -289,32 +296,26 @@ class Weibo(object):
 
     def _normalize_since_date(self, value):
         """
-        归一化 per-user since_date：
-        支持：
-        - None / ""：使用默认 self.since_date
-        - int 或 数字字符串：视为“过去 N 天”
-        - yyyy-mm-dd：转换为 yyyy-mm-ddT00:00:00
-        - yyyy-mm-ddTHH:MM:SS：直接使用
+        归一化 per-user since_date（必填）：
+        只支持：
+        - yyyy-mm-dd
+        - yyyy-mm-ddTHH:MM:SS
         """
-        if not value and value != 0:
-            return self.since_date
-
-        # 数字或数字字符串：天数
-        if isinstance(value, int) or (isinstance(value, str) and value.strip().isdigit()):
-            days = int(value)
-            dt = date.today() - timedelta(days)
-            return dt.strftime(DTFORMAT)
+        if value is None:
+            logger.error("since_date 为必填字段，请在 user_id_list 中配置")
+            sys.exit()
 
         if isinstance(value, str):
             token = value.strip()
             if not token:
-                return self.since_date
+                logger.error("since_date 为必填字段，请在 user_id_list 中配置")
+                sys.exit()
             if self.is_datetime(token):
                 return token
             if self.is_date(token):
                 return "{}T00:00:00".format(token)
 
-        logger.error("since_date 格式不正确，请确认配置是否正确: %s", value)
+        logger.error("since_date 格式不正确，只支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", value)
         sys.exit()
 
     def get_json(self, params):
@@ -1416,6 +1417,14 @@ class Weibo(object):
                             since_date = datetime.strptime(
                                 self.user_config["since_date"], DTFORMAT
                             )
+                            # 可选 end_date：用于过滤微博的结束时间（不抓取 end_date 之后的微博）
+                            end_date_token = self.user_config.get("end_date")
+                            end_date = None
+                            if end_date_token:
+                                try:
+                                    end_date = datetime.strptime(end_date_token, DTFORMAT)
+                                except Exception:
+                                    end_date = None
                             if const.MODE == "append":
                                 # append模式下不会对置顶微博做任何处理
 
@@ -1461,7 +1470,8 @@ class Weibo(object):
                                     convert_to_days_ago(self.last_weibo_date, 1),
                                     DTFORMAT,
                                 )
-                            if created_at < since_date:
+                            # created_at 必须在 [since_date, end_date] 范围内
+                            if created_at < since_date or (end_date and created_at > end_date):
                                 if self.is_pinned_weibo(w):
                                     continue
                                 # 如果要检查还没有检查cookie，不能直接跳出
