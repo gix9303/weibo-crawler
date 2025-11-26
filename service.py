@@ -12,6 +12,7 @@ import uuid
 import time
 from datetime import datetime
 from html import escape
+from util.notify import push_deer
 
 # 1896820725 天津股侠 2024-12-09T16:47:04
 
@@ -123,6 +124,75 @@ def get_config(user_id_list=None):
     handle_config_renaming(current_config, oldName="result_dir_name", newName="user_id_as_folder_name")
     return current_config
 
+
+def _extract_user_ids_from_config(config: dict) -> list[str]:
+    """
+    从配置中解析用户ID列表：
+    - 如果 user_id_list 是 list，直接返回其中的字符串形式
+    - 如果是 txt 路径，则读取文件并解析每行首个数字字段作为 user_id
+    - 如果是单个 id 字符串，返回单元素列表
+    """
+    raw = config.get("user_id_list")
+    ids: list[str] = []
+    if isinstance(raw, list):
+        ids = [str(x).strip() for x in raw if str(x).strip()]
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if s.endswith(".txt"):
+            txt_path = s
+            if not os.path.isabs(txt_path):
+                txt_path = os.path.join(
+                    os.path.split(os.path.realpath(__file__))[0], txt_path
+                )
+            try:
+                with open(txt_path, "rb") as f:
+                    lines = f.read().splitlines()
+                    lines = [line.decode("utf-8-sig") for line in lines]
+                for line in lines:
+                    parts = line.strip().split(" ")
+                    if parts and parts[0].isdigit():
+                        ids.append(parts[0])
+            except Exception as e:
+                logger.warning("从 %s 解析 user_id_list 失败: %s", txt_path, e)
+        elif s:
+            ids = [s]
+    return ids
+
+
+def _resolve_user_names_for_notification(config: dict) -> str:
+    """
+    根据 config 中的 user_id_list，从 SQLite user 表解析出用户昵称列表。
+    找不到昵称时回退显示 user_id。
+    """
+    user_ids = _extract_user_ids_from_config(config)
+    if not user_ids:
+        return ""
+
+    names: list[str] = []
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        for uid in user_ids:
+            try:
+                cur.execute("SELECT nick_name FROM user WHERE id = ?", (uid,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    names.append(str(row[0]))
+                else:
+                    names.append(uid)
+            except Exception:
+                names.append(uid)
+    except Exception as e:
+        logger.warning("查询用户昵称失败，将使用 user_id 列表: %s", e)
+        return ",".join(user_ids)
+    finally:
+        try:
+            conn.close()  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+    return ",".join(names) if names else ",".join(user_ids)
+
 def run_refresh_task(task_id, user_id_list=None):
     global current_task_id
     try:
@@ -134,6 +204,7 @@ def run_refresh_task(task_id, user_id_list=None):
         tasks[task_id]['progress'] = 50
         
         wb.start()  # 爬取微博信息
+
         # 爬取完成后，更新 config.json 中的 end_date 为当前系统时间
         try:
             config_path = os.path.join(os.path.split(os.path.realpath(__file__))[0], "config.json")
@@ -148,11 +219,26 @@ def run_refresh_task(task_id, user_id_list=None):
         tasks[task_id]['progress'] = 100
         tasks[task_id]['state'] = 'SUCCESS'
         tasks[task_id]['result'] = {"message": "微博列表已刷新"}
+
+        # 任务成功完成后发送 PushDeer 通知
+        try:
+            if const.NOTIFY.get("NOTIFY"):
+                name_str = _resolve_user_names_for_notification(config) or "未知用户"
+                push_deer(f"微博爬虫任务 {task_id} 已完成，用户：{name_str}")
+        except Exception as notify_err:
+            logger.warning("发送 PushDeer 成功通知失败: %s", notify_err)
         
     except Exception as e:
         tasks[task_id]['state'] = 'FAILED'
         tasks[task_id]['error'] = str(e)
         logger.exception(e)
+        # 任务失败时也发送 PushDeer 通知
+        try:
+            if const.NOTIFY.get("NOTIFY"):
+                name_str = _resolve_user_names_for_notification(config) or "未知用户"
+                push_deer(f"微博爬虫任务 {task_id} 失败，用户：{name_str}，错误：{e}")
+        except Exception as notify_err:
+            logger.warning("发送 PushDeer 失败通知失败: %s", notify_err)
     finally:
         with task_lock:
             if current_task_id == task_id:
