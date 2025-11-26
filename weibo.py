@@ -1357,7 +1357,7 @@ class Weibo(object):
         try:
             js = self.get_weibo_json(page)
             import json
-            with open('js.json','w') as f:
+            with open('js.json', 'w') as f:
                 #写入方式1，等价于下面这行
                 json.dump(js,f) #把列表numbers内容写入到"list.json"文件中
             if js["ok"]:
@@ -2508,20 +2508,3 @@ def get_config():
             "config.json 格式不正确，请参考 " "https://github.com/dataabc/weibo-crawler#3程序设置"
         )
         sys.exit()
-
-
-def main():
-    try:
-        config = get_config()
-        wb = Weibo(config)
-        wb.start()  # 爬取微博信息
-        if const.NOTIFY["NOTIFY"]:
-            push_deer("更新了一次微博")
-    except Exception as e:
-        if const.NOTIFY["NOTIFY"]:
-            push_deer("weibo-crawler运行出错，错误为{}".format(e))
-        logger.exception(e)
-
-
-if __name__ == "__main__":
-    main()
