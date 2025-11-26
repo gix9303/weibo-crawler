@@ -59,8 +59,7 @@ def index():
         <h1>Weibo Crawler Service 接口列表</h1>
         <ul>
           <li>
-            <strong>POST /refresh</strong> - 启动一次新的爬虫任务（需要 JSON 参数
-            <code>{"user_id_list": ["uid1", "uid2"]}</code>）
+            <a href="/refresh"><strong>POST /refresh</strong></a> - 启动一次新的爬虫任务
           </li>
           <li>
             <a href="/tasks"><strong>GET /tasks</strong></a> - 列出所有任务及其状态
@@ -135,6 +134,17 @@ def run_refresh_task(task_id, user_id_list=None):
         tasks[task_id]['progress'] = 50
         
         wb.start()  # 爬取微博信息
+        # 爬取完成后，更新 config.json 中的 end_date 为当前系统时间
+        try:
+            config_path = os.path.join(os.path.split(os.path.realpath(__file__))[0], "config.json")
+            with open(config_path, "r", encoding="utf-8") as f:
+                latest_cfg = json.load(f)
+            latest_cfg["end_date"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(latest_cfg, f, ensure_ascii=False, indent=4)
+        except Exception as cfg_err:
+            logger.warning("更新 config.json 中 end_date 失败: %s", cfg_err)
+
         tasks[task_id]['progress'] = 100
         tasks[task_id]['state'] = 'SUCCESS'
         tasks[task_id]['result'] = {"message": "微博列表已刷新"}
@@ -148,50 +158,253 @@ def run_refresh_task(task_id, user_id_list=None):
             if current_task_id == task_id:
                 current_task_id = None
 
-@app.route('/refresh', methods=['POST'])
+@app.route('/refresh', methods=['GET', 'POST'])
 def refresh():
+    """
+    刷新任务接口：
+    - GET：展示一个可以在线编辑关键配置项的界面（user_id_list、since_date、end_date、cookie、notify.enable、notify.push_key），并展示完整的 config.json
+    - POST（表单提交）：保存页面输入到 config.json，并启动一次爬虫任务
+    - POST（JSON）：兼容旧用法，仍然可以通过 JSON 传 user_id_list 启动任务
+    """
     global current_task_id
-    
-    # 获取请求参数
-    data = request.get_json()
-    user_id_list = data.get('user_id_list') if data else None
-    
-    # 验证参数：支持 list（显式用户ID列表）或 str（user_id_list.txt 路径），
-    # 与 weibo.py 的 config.json 约定保持一致
-    if not user_id_list or not isinstance(user_id_list, (list, str)):
-        return jsonify({
-            'error': 'Invalid user_id_list parameter, must be list or txt path string'
-        }), 400
-    
-    # 检查是否有正在运行的任务
-    with task_lock:
-        running_task_id, running_task = get_running_task()
-        if running_task:
-            return jsonify({
-                'task_id': running_task_id,
-                'status': 'Task already running',
-                'state': running_task['state'],
-                'progress': running_task['progress']
-            }), 409  # 409 Conflict
-        
-        # 创建新任务
-        task_id = str(uuid.uuid4())
-        tasks[task_id] = {
-            'state': 'PENDING',
-            'progress': 0,
-            'created_at': datetime.now().isoformat(),
-            'user_id_list': user_id_list
-        }
-        current_task_id = task_id
-        
-    executor.submit(run_refresh_task, task_id, user_id_list)
-    return jsonify({
-        'task_id': task_id,
-        'status': 'Task started',
-        'state': 'PENDING',
-        'progress': 0,
-        'user_id_list': user_id_list
-    }), 202
+
+    # 计算 config.json 路径
+    config_path = os.path.join(os.path.split(os.path.realpath(__file__))[0], "config.json")
+
+    # --- GET：渲染配置编辑页面 ------------------------------------------
+    if request.method == 'GET':
+        try:
+            cfg = load_config_from_file()
+        except SystemExit:
+            # load_config_from_file 内部可能会因格式错误退出，这里做保护
+            cfg = {}
+        except Exception:
+            cfg = {}
+
+        # user_id_list 在界面上只展示为逗号分隔的用户ID：
+        # - 如果 config.json 中是 list，则直接 join
+        # - 如果是 txt 路径，则读取文件，取每行首个数字字段作为用户ID
+        # - 否则原样展示
+        raw_user_id_list = cfg.get("user_id_list", "")
+        user_id_list_val = ""
+        if isinstance(raw_user_id_list, list):
+            user_id_list_val = ",".join(
+                str(x).strip() for x in raw_user_id_list if str(x).strip()
+            )
+        elif isinstance(raw_user_id_list, str):
+            s = raw_user_id_list.strip()
+            if s.endswith(".txt"):
+                txt_path = s
+                if not os.path.isabs(txt_path):
+                    txt_path = os.path.join(
+                        os.path.split(os.path.realpath(__file__))[0], txt_path
+                    )
+                ids = []
+                try:
+                    with open(txt_path, "rb") as f:
+                        lines = f.read().splitlines()
+                        lines = [line.decode("utf-8-sig") for line in lines]
+                    for line in lines:
+                        parts = line.strip().split(" ")
+                        if parts and parts[0].isdigit():
+                            ids.append(parts[0])
+                except Exception as e:
+                    logger.warning("读取 user_id_list 配置文件 %s 失败: %s", txt_path, e)
+                if ids:
+                    user_id_list_val = ",".join(ids)
+                else:
+                    user_id_list_val = ""
+            else:
+                user_id_list_val = s
+        since_date_val = cfg.get("since_date", "")
+        end_date_val = cfg.get("end_date", "")
+        cookie_val = cfg.get("cookie", "")
+        notify_cfg = cfg.get("notify") or {}
+        notify_enable_val = bool(notify_cfg.get("enable", False))
+        notify_push_key_val = notify_cfg.get("push_key", "")
+
+        checked_attr = "checked" if notify_enable_val else ""
+
+        html = f"""
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>刷新任务（配置编辑）</title>
+            <script>
+              function togglePushKey() {{
+                  var cb = document.getElementById('notify_enable');
+                  var div = document.getElementById('notify_push_key_container');
+                  if (!cb) return;
+                  div.style.display = cb.checked ? 'inline-block' : 'none';
+              }}
+            </script>
+          </head>
+          <body onload="togglePushKey()">
+            <h1>刷新任务（配置编辑）</h1>
+            <form method="post" action="/refresh">
+              <table border="1" cellspacing="0" cellpadding="4">
+                <tr>
+                  <th>user_id_list</th>
+                  <td>
+                    <input type="text" name="user_id_list" style="width:400px;"
+                           value="{escape(str(user_id_list_val))}" />
+                    <br/>
+                    <small>只填写用户 ID，多个用英文逗号分隔，例如：111,222,333。</small>
+                  </td>
+                </tr>
+                <tr>
+                  <th>since_date</th>
+                  <td>
+                    <input type="text" name="since_date" style="width:400px;"
+                           value="{escape(str(since_date_val))}" />
+                    <br/>
+                    <small>支持整数（天数）、yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS。</small>
+                  </td>
+                </tr>
+                <tr>
+                  <th>end_date</th>
+                  <td>
+                    <input type="text" name="end_date" style="width:400px;"
+                           value="{escape(str(end_date_val))}" />
+                    <br/>
+                    <small>系统会在爬取完成后自动写入当前时间（yyyy-mm-ddTHH:MM:SS）。</small>
+                  </td>
+                </tr>
+                <tr>
+                  <th>cookie</th>
+                  <td>
+                    <textarea name="cookie" rows="4" cols="80">{escape(str(cookie_val))}</textarea>
+                  </td>
+                </tr>
+                <tr>
+                  <th>notify</th>
+                  <td>
+                    <label style="margin-right: 8px;">
+                      <input type="checkbox" id="notify_enable" name="notify_enable" value="1" {checked_attr}
+                             onchange="togglePushKey()" />
+                      启用通知
+                    </label>
+                    <span id="notify_push_key_container" style="display:none;">
+                      push_key:
+                      <input type="text" name="notify_push_key" style="width:260px;"
+                             value="{escape(str(notify_push_key_val))}" />
+                    </span>
+                  </td>
+                </tr>
+              </table>
+              <br/>
+              <button type="submit">保存配置并启动任务</button>
+            </form>
+            <p><a href="/">返回首页</a></p>
+          </body>
+        </html>
+        """
+        return html
+
+    # --- POST：如果是表单提交，保存页面输入并启动任务 --------------------
+    if not request.is_json:
+        # 读取原始配置
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+
+        form = request.form
+
+        # 更新关键字段
+        user_id_list_val = form.get("user_id_list", "").strip()
+        since_date_val = form.get("since_date", "").strip()
+        end_date_val = form.get("end_date", "").strip()
+        cookie_val = form.get("cookie", "").strip()
+        notify_enable_val = form.get("notify_enable") is not None
+        notify_push_key_val = form.get("notify_push_key", "").strip()
+
+        # user_id_list 只允许填写用户ID，多个用英文逗号分隔。
+        # 如果填写，则解析为列表写入 config.json；如果留空，则保留原值（可能是 txt 路径）。
+        if user_id_list_val != "":
+            ids = [x.strip() for x in user_id_list_val.split(",") if x.strip()]
+            # 简单校验：都为数字
+            if not ids or not all(i.isdigit() for i in ids):
+                return "user_id_list 格式错误，只能填写数字ID，多个用英文逗号分隔，例如：111,222,333", 400
+            cfg["user_id_list"] = ids
+        if since_date_val != "":
+            cfg["since_date"] = since_date_val
+        if end_date_val != "":
+            cfg["end_date"] = end_date_val
+        # 如果 end_date 为空，保留旧值；系统会在任务完成后自动写入当前时间
+
+        cfg["cookie"] = cookie_val
+
+        notify_cfg = cfg.get("notify") or {}
+        if not isinstance(notify_cfg, dict):
+            notify_cfg = {}
+        notify_cfg["enable"] = bool(notify_enable_val)
+        # 只有在输入非空时才更新 push_key，避免意外清空
+        if notify_push_key_val != "":
+            notify_cfg["push_key"] = notify_push_key_val
+        cfg["notify"] = notify_cfg
+
+        # 写回 config.json
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            return f"保存 config.json 失败: {e}", 500
+
+        # 启动任务，使用最新 config.json 中的 user_id_list
+        user_id_list = cfg.get("user_id_list")
+
+        with task_lock:
+            running_task_id, running_task = get_running_task()
+            if running_task:
+                html = f"""
+                <html>
+                  <head><meta charset="utf-8"><title>任务已在运行</title></head>
+                  <body>
+                    <h1>已有任务正在运行</h1>
+                    <p>当前任务 ID：{escape(running_task_id)}</p>
+                    <p><a href="/status">查看当前状态</a> | <a href="/tasks">查看所有任务</a> | <a href="/">返回首页</a></p>
+                  </body>
+                </html>
+                """
+                return html, 409
+
+            task_id = str(uuid.uuid4())
+            tasks[task_id] = {
+                'state': 'PENDING',
+                'progress': 0,
+                'created_at': datetime.now().isoformat(),
+                'user_id_list': user_id_list,
+            }
+            current_task_id = task_id
+
+        # 提交任务，传入 None，让 run_refresh_task 自行通过 get_config 读取最新配置
+        executor.submit(run_refresh_task, task_id, None)
+
+        html = f"""
+        <html>
+          <head><meta charset="utf-8"><title>任务已启动</title></head>
+          <body>
+            <h1>任务已启动</h1>
+            <table border="1" cellspacing="0" cellpadding="4">
+              <tr><th>task_id</th><td><a href="/task/{escape(task_id)}">{escape(task_id)}</a></td></tr>
+              <tr><th>state</th><td>PENDING</td></tr>
+              <tr><th>progress</th><td>0</td></tr>
+              <tr><th>user_id_list</th><td>{escape(str(user_id_list))}</td></tr>
+            </table>
+            <p>
+              <a href="/status">查看当前状态</a> |
+              <a href="/tasks">查看所有任务</a> |
+              <a href="/">返回首页</a>
+            </p>
+          </body>
+        </html>
+        """
+        return html, 202
+
+    # 走到这里说明既不是 GET，也不是表单 POST，直接返回 400
+    return "Unsupported request type for /refresh", 400
 
 @app.route('/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):
