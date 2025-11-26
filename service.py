@@ -11,6 +11,7 @@ import threading
 import uuid
 import time
 from datetime import datetime
+from html import escape
 
 # 1896820725 天津股侠 2024-12-09T16:47:04
 
@@ -27,6 +28,22 @@ logger = logging.getLogger("api")
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False  # 确保JSON响应中的中文不会被转义
 app.config['JSONIFY_MIMETYPE'] = 'application/json;charset=utf-8'
+
+
+def wants_html() -> bool:
+    """
+    判断当前请求是否更适合返回 HTML。
+    - 浏览器访问（Accept=text/html）时返回表格 HTML
+    - curl / 代码访问默认返回 JSON
+    - 也可通过 ?format=html 或 ?format=json 强制指定
+    """
+    fmt = request.args.get("format")
+    if fmt == "json":
+        return False
+    if fmt == "html":
+        return True
+    best = request.accept_mimetypes.best
+    return best == "text/html"
 
 
 @app.route('/', methods=['GET'])
@@ -46,9 +63,6 @@ def index():
             <code>{"user_id_list": ["uid1", "uid2"]}</code>）
           </li>
           <li>
-            <strong>GET /task/&lt;task_id&gt;</strong> - 根据任务 ID 查询该任务状态
-          </li>
-          <li>
             <a href="/tasks"><strong>GET /tasks</strong></a> - 列出所有任务及其状态
           </li>
           <li>
@@ -57,11 +71,7 @@ def index():
           <li>
             <a href="/weibos"><strong>GET /weibos</strong></a> - 查看数据库中全部微博列表（按时间倒序）
           </li>
-          <li>
-            <strong>GET /weibos/&lt;weibo_id&gt;</strong> - 查看指定微博的详情
-          </li>
         </ul>
-        <p>建议使用 curl 或 Postman 调用 <code>/refresh</code> 等需要 POST 的接口。</p>
       </body>
     </html>
     """
@@ -187,17 +197,54 @@ def refresh():
 def get_task_status(task_id):
     task = tasks.get(task_id)
     if not task:
-        return jsonify({'error': 'Task not found'}), 404
+        data = {'error': 'Task not found'}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>任务详情</title></head>
+              <body>
+                <h1>任务 {escape(task_id)} 未找到</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a></p>
+              </body>
+            </html>
+            """
+            return html, 404
+        return jsonify(data), 404
 
     response = {
-        'state': task['state'],
-        'progress': task['progress']
+        'task_id': task_id,
+        'state': task.get('state'),
+        'progress': task.get('progress'),
+        'created_at': task.get('created_at'),
+        'user_id_list': task.get('user_id_list'),
     }
-    
-    if task['state'] == 'SUCCESS':
+    if task.get('state') == 'SUCCESS':
         response['result'] = task.get('result')
-    elif task['state'] == 'FAILED':
+    elif task.get('state') == 'FAILED':
         response['error'] = task.get('error')
+
+    if wants_html():
+        rows = []
+        for k, v in response.items():
+            rows.append(
+                f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
+            )
+        html = f"""
+        <html>
+          <head><meta charset="utf-8"><title>任务详情 {escape(task_id)}</title></head>
+          <body>
+            <h1>任务详情</h1>
+            <table border="1" cellspacing="0" cellpadding="4">
+              {''.join(rows)}
+            </table>
+            <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+          </body>
+        </html>
+        """
+        return html
 
     return jsonify(response)
 
@@ -219,6 +266,39 @@ def list_tasks():
             'user_id_list': t.get('user_id_list'),
         })
     items.sort(key=lambda x: x.get('created_at') or "", reverse=True)
+    if wants_html():
+        header_cells = "".join(
+            f"<th>{escape(col)}</th>"
+            for col in ["task_id", "state", "progress", "created_at", "user_id_list"]
+        )
+        body_rows = []
+        for it in items:
+            body_rows.append(
+                "<tr>"
+                # task_id 列作为链接，点击跳到 /task/<task_id>
+                f"<td><a href=\"/task/{escape(it['task_id'])}\">{escape(it['task_id'])}</a></td>"
+                f"<td>{escape(str(it.get('state')))}</td>"
+                f"<td>{escape(str(it.get('progress')))}</td>"
+                f"<td>{escape(str(it.get('created_at')))}</td>"
+                f"<td>{escape(str(it.get('user_id_list')))}</td>"
+                "</tr>"
+            )
+        html = f"""
+        <html>
+          <head><meta charset="utf-8"><title>任务列表</title></head>
+          <body>
+            <h1>任务列表</h1>
+            <table border="1" cellspacing="0" cellpadding="4">
+              <thead><tr>{header_cells}</tr></thead>
+              <tbody>
+                {''.join(body_rows)}
+              </tbody>
+            </table>
+            <p><a href="/">返回首页</a></p>
+          </body>
+        </html>
+        """
+        return html
     return jsonify(items)
 
 
@@ -231,13 +311,40 @@ def get_current_status():
     """
     running_task_id, running_task = get_running_task()
     if running_task:
-        return jsonify({
+        data = {
             'task_id': running_task_id,
             'state': running_task['state'],
             'progress': running_task['progress'],
             'created_at': running_task.get('created_at'),
             'user_id_list': running_task.get('user_id_list'),
-        }), 200
+        }
+        if wants_html():
+            # task_id 挂上跳转到 /task/<task_id> 的链接
+            task_link = (
+                f"<a href=\"/task/{escape(str(data['task_id']))}\">"
+                f"{escape(str(data['task_id']))}</a>"
+            )
+            rows = [
+                f"<tr><th>task_id</th><td>{task_link}</td></tr>",
+                f"<tr><th>state</th><td>{escape(str(data['state']))}</td></tr>",
+                f"<tr><th>progress</th><td>{escape(str(data['progress']))}</td></tr>",
+                f"<tr><th>created_at</th><td>{escape(str(data['created_at']))}</td></tr>",
+                f"<tr><th>user_id_list</th><td>{escape(str(data['user_id_list']))}</td></tr>",
+            ]
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>当前状态</title></head>
+              <body>
+                <h1>当前运行任务</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  {''.join(rows)}
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 200
+        return jsonify(data), 200
 
     # 没有正在运行的任务，尝试给出最近一个任务的简要信息（如果有）
     last_task_id = None
@@ -255,19 +362,50 @@ def get_current_status():
             continue
 
     if last_task:
-        return jsonify({
+        data = {
             'state': 'IDLE',
             'current_task': None,
             'last_task_id': last_task_id,
             'last_state': last_task.get('state'),
             'last_progress': last_task.get('progress'),
             'last_created_at': last_task.get('created_at'),
-        }), 200
+        }
+    else:
+        data = {
+            'state': 'IDLE',
+            'current_task': None,
+        }
 
-    return jsonify({
-        'state': 'IDLE',
-        'current_task': None,
-    }), 200
+    if wants_html():
+        rows = []
+        for k, v in data.items():
+            # last_task_id 挂上跳转到 /task/<last_task_id> 的链接
+            if k == "last_task_id" and v:
+                link = (
+                    f"<a href=\"/task/{escape(str(v))}\">"
+                    f"{escape(str(v))}</a>"
+                )
+                rows.append(
+                    f"<tr><th>{escape(str(k))}</th><td>{link}</td></tr>"
+                )
+            else:
+                rows.append(
+                    f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
+                )
+        html = f"""
+        <html>
+          <head><meta charset="utf-8"><title>当前状态</title></head>
+          <body>
+            <h1>当前状态</h1>
+            <table border="1" cellspacing="0" cellpadding="4">
+              {''.join(rows)}
+            </table>
+            <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+          </body>
+        </html>
+        """
+        return html, 200
+    return jsonify(data), 200
 
 @app.route('/weibos', methods=['GET'])
 def get_weibos():
@@ -282,10 +420,41 @@ def get_weibos():
             weibo = dict(zip(columns, row))
             weibos.append(weibo)
         conn.close()
-        res1 = json.dumps(weibos, ensure_ascii=False)
-        print(res1)
+        if wants_html():
+            # 简单表格展示所有字段，其中 id 列可点击跳转到 /weibos/<weibo_id>
+            header_cells = "".join(f"<th>{escape(str(col))}</th>" for col in columns)
+            body_rows = []
+            for item in weibos:
+                row_cells = []
+                for col in columns:
+                    val = item.get(col)
+                    if col == "id":
+                        cell = (
+                            f"<td><a href=\"/weibos/{escape(str(val))}\">"
+                            f"{escape(str(val))}</a></td>"
+                        )
+                    else:
+                        cell = f"<td>{escape(str(val))}</td>"
+                    row_cells.append(cell)
+                body_rows.append("<tr>" + "".join(row_cells) + "</tr>")
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>微博列表</title></head>
+              <body>
+                <h1>微博列表</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <thead><tr>{header_cells}</tr></thead>
+                  <tbody>
+                    {''.join(body_rows)}
+                  </tbody>
+                </table>
+                <p><a href=\"/\">返回首页</a></p>
+              </body>
+            </html>
+            """
+            return html, 200
+
         res = jsonify(weibos)
-        print(res)
         return res, 200
     except Exception as e:
         logger.exception(e)
@@ -303,9 +472,43 @@ def get_weibo_detail(weibo_id):
         
         if row:
             weibo = dict(zip(columns, row))
+            if wants_html():
+                rows = []
+                for k, v in weibo.items():
+                    rows.append(
+                        f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
+                    )
+                html = f"""
+                <html>
+                  <head><meta charset="utf-8"><title>微博详情 {escape(str(weibo_id))}</title></head>
+                  <body>
+                    <h1>微博详情</h1>
+                    <table border="1" cellspacing="0" cellpadding="4">
+                      {''.join(rows)}
+                    </table>
+                    <p><a href=\"/weibos\">返回微博列表</a> | <a href=\"/\">返回首页</a></p>
+                  </body>
+                </html>
+                """
+                return html, 200
             return jsonify(weibo), 200
         else:
-            return {"error": "Weibo not found"}, 404
+            data = {"error": "Weibo not found"}
+            if wants_html():
+                html = f"""
+                <html>
+                  <head><meta charset="utf-8"><title>微博未找到</title></head>
+                  <body>
+                    <h1>微博 {escape(str(weibo_id))} 未找到</h1>
+                    <table border="1" cellspacing="0" cellpadding="4">
+                      <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                    </table>
+                    <p><a href=\"/weibos\">返回微博列表</a> | <a href=\"/\">返回首页</a></p>
+                  </body>
+                </html>
+                """
+                return html, 404
+            return data, 404
     except Exception as e:
         logger.exception(e)
         return {"error": str(e)}, 500
