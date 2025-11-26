@@ -192,6 +192,8 @@ class Weibo(object):
         self.user_config_list = user_config_list  # 要爬取的微博用户的user_config列表
         self.user_config = {}  # 当前用户配置,包含用户id和since_date
         self.start_date = ""  # 获取当前用户本次抓取的起始时间
+        # 可选的进度回调，用于向外部报告整体进度百分比 (0-100)
+        self.progress_callback = None
         self.query = ""
         self.user = {}  # 存储目标微博用户信息
         self.got_count = 0  # 存储爬取到的微博数
@@ -317,6 +319,10 @@ class Weibo(object):
 
         logger.error("since_date 格式不正确，只支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", value)
         sys.exit()
+
+    def set_progress_callback(self, callback):
+        """设置进度回调函数，签名为 callback(percent:int)，0-100。"""
+        self.progress_callback = callback
 
     def get_json(self, params):
         url = "https://m.weibo.cn/api/container/getIndex?"
@@ -2420,8 +2426,21 @@ class Weibo(object):
                 random_pages = random.randint(1, 5)
                 self.start_date = datetime.now().strftime(DTFORMAT)
                 pages = range(self.start_page, page_count + 1)
-                for page in tqdm(pages, desc="Progress"):
+
+                for idx, page in enumerate(tqdm(pages, desc="Progress"), start=1):
                     is_end = self.get_one_page(page)
+
+                    # page 级进度更新：以用户为单位，对总任务进度加权
+                    if self.progress_callback and page_count > 0:
+                        try:
+                            user_frac = min(1.0, float(idx) / float(page_count))
+                            overall_frac = ((self.current_user_index - 1) + user_frac) / float(self.total_users or 1)
+                            pct = int(overall_frac * 100)
+                            pct = max(0, min(100, pct))
+                            self.progress_callback(pct)
+                        except Exception as cb_err:
+                            logger.warning("进度回调执行失败: %s", cb_err)
+
                     if is_end:
                         break
 
@@ -2453,7 +2472,12 @@ class Weibo(object):
     def start(self):
         """运行爬虫"""
         try:
+            # 初始化总用户数，供进度计算使用
+            self.total_users = len(self.user_config_list) or 1
+            self.current_user_index = 0
+
             for user_config in self.user_config_list:
+                self.current_user_index += 1
                 if len(user_config["query_list"]):
                     for query in user_config["query_list"]:
                         self.query = query
@@ -2473,6 +2497,12 @@ class Weibo(object):
 
                 logger.info("信息抓取完毕")
                 logger.info("*" * 100)
+                # 用户完成时，如果未在 get_pages 中达到 100%，这里兜底更新一次
+                if self.progress_callback:
+                    try:
+                        self.progress_callback( int(100 * float(self.current_user_index) / float(self.total_users)) )
+                    except Exception as cb_err:
+                        logger.warning("进度回调执行失败: %s", cb_err)
         except Exception as e:
             logger.exception(e)
 

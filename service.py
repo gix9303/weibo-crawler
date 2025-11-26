@@ -187,7 +187,17 @@ def run_refresh_task(task_id, user_id_list=None):
         
         config = get_config(user_id_list)
         wb = Weibo(config)
-        tasks[task_id]['progress'] = 50
+
+        # 设置进度回调：由 Weibo 内部按“用户数 + 每个用户的分页”计算整体百分比
+        def progress_cb(percent):
+            try:
+                pct = int(percent)
+            except Exception:
+                pct = 0
+            pct = max(0, min(100, pct))
+            tasks[task_id]['progress'] = pct
+
+        wb.set_progress_callback(progress_cb)
         
         wb.start()  # 爬取微博信息
 
