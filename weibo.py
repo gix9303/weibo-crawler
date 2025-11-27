@@ -2269,14 +2269,13 @@ class Weibo(object):
 
     def get_sqlite_connection(self):
         path = self.get_sqlte_path()
-        create = False
-        if not os.path.exists(path):
-            create = True
-
         con = sqlite3.connect(path)
 
-        if create == True:
+        # 无论数据库文件是否已存在，都执行一次建表脚本（内部使用 IF NOT EXISTS，不会重复建表）
+        try:
             self.create_sqlite_table(connection=con)
+        except Exception as e:
+            logger.warning("初始化 SQLite 表失败: %s", e)
 
         return con
 

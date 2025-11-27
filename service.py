@@ -3,7 +3,7 @@ import const
 import logging
 import logging.config
 import os
-from flask import Flask, jsonify, request, redirect
+from flask import Flask, jsonify, request, redirect, send_file
 import sqlite3
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -89,6 +89,14 @@ task_lock = threading.Lock()  # 防止同时创建/修改 current_task_id
 
 def _init_tasks_table():
     """初始化 tasks 表，用于持久化任务列表。"""
+    # 确保数据库目录存在（例如 ./weibo），否则 sqlite 无法创建数据库文件
+    db_dir = os.path.dirname(os.path.abspath(DATABASE_PATH))
+    if db_dir and (not os.path.isdir(db_dir)):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning("创建数据库目录失败 %s: %s", db_dir, e)
+
     conn = None
     try:
         conn = sqlite3.connect(DATABASE_PATH)
@@ -831,6 +839,101 @@ def stop_task(task_id):
     return jsonify({"message": "停止请求已发送", "task_id": task_id}), 200
 
 
+@app.route('/task/<task_id>/download', methods=['GET'])
+def download_task_weibo(task_id):
+    """
+    为指定任务提供当前 weibo 目录内容的打包下载。
+    目前不区分任务产生的文件，直接将 /weibo 目录整体打包为 zip 返回。
+    仅在任务 state=SUCCESS 时允许下载。
+    """
+    task = db_get_task(task_id)
+    if not task:
+        data = {"error": "Task not found"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载任务结果</title></head>
+              <body>
+                <h1>任务 {escape(task_id)} 未找到</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 404
+        return jsonify(data), 404
+
+    if task.get("state") != "SUCCESS":
+        msg = f"任务当前状态为 {task.get('state')}，仅在 SUCCESS 状态下才可下载 weibo 目录内容"
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载任务结果</title></head>
+              <body>
+                <h1>无法下载任务 {escape(task_id)} 的结果</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>state</th><td>{escape(str(task.get('state')))}</td></tr>
+                  <tr><th>message</th><td>{escape(msg)}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a> | <a href="/task/{escape(task_id)}">返回任务详情</a></p>
+              </body>
+            </html>
+            """
+            return html, 400
+        return jsonify({"error": msg, "state": task.get("state")}), 400
+
+    base_dir = os.path.split(os.path.realpath(__file__))[0]
+    weibo_dir = os.path.join(base_dir, "weibo")
+    if not os.path.isdir(weibo_dir):
+        data = {"error": f"weibo 目录不存在: {weibo_dir}"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载任务结果</title></head>
+              <body>
+                <h1>下载失败</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 500
+        return jsonify(data), 500
+
+    # 将 weibo 目录打包为 zip 并返回
+    import tempfile
+    import shutil
+
+    tmp_dir = tempfile.gettempdir()
+    archive_base = os.path.join(tmp_dir, f"weibo_{task_id}")
+    try:
+        zip_path = shutil.make_archive(archive_base, "zip", weibo_dir)
+    except Exception as e:
+        logger.exception("打包 weibo 目录失败: %s", e)
+        data = {"error": f"打包 weibo 目录失败: {e}"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载任务结果</title></head>
+              <body>
+                <h1>下载失败</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 500
+        return jsonify(data), 500
+
+    download_name = f"weibo_{task_id}.zip"
+    return send_file(zip_path, as_attachment=True, download_name=download_name, mimetype="application/zip")
+
 @app.route('/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):
     task = db_get_task(task_id)
@@ -870,6 +973,12 @@ def get_task_status(task_id):
             rows.append(
                 f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
             )
+        # 如果任务成功完成，提供下载 weibo 目录内容的链接
+        download_link_html = ""
+        if task.get('state') == 'SUCCESS':
+            download_link_html = (
+                f"<p><a href=\"/task/{escape(task_id)}/download\">下载当前 weibo 目录内容</a></p>"
+            )
         # 如果任务仍在运行，则提供“停止该任务”的按钮；
         # 当 command 已为 STOP 时，按钮置灰不可用
         stop_button_html = ""
@@ -895,6 +1004,7 @@ def get_task_status(task_id):
             <table border="1" cellspacing="0" cellpadding="4">
               {''.join(rows)}
             </table>
+            {download_link_html}
             <p>{stop_button_html}<a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
           </body>
         </html>
