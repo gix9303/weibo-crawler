@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 from html import escape
 from util.notify import push_deer
+import re
 
 # 1896820725 天津股侠 2024-12-09T16:47:04
 
@@ -924,7 +925,7 @@ def download_task_weibo(task_id):
 
     base_dir = os.path.split(os.path.realpath(__file__))[0]
     weibo_root = os.path.join(base_dir, "weibo")
-    # 仅打包该任务专属目录 weibo/<task_id>/；如果不存在则直接报错，不再回退打包整个 weibo 目录
+    # 仅打包该任务专属目录 weibo/<task_id>/；如果不存在则直接报错
     task_weibo_dir = os.path.join(weibo_root, task_id)
     if not os.path.isdir(task_weibo_dir):
         data = {"error": f"未找到该任务对应的结果目录: {task_weibo_dir}"}
@@ -944,7 +945,72 @@ def download_task_weibo(task_id):
             return html, 500
         return jsonify(data), 500
 
-    # 将 weibo 目录打包为 zip 并返回
+    # 生成压缩包文件名：用户昵称+开始日期+结束日期+任务id前5位
+    user_id_list = task.get("user_id_list") or []
+    first_uid = None
+    if isinstance(user_id_list, list):
+        for item in user_id_list:
+            uid = None
+            if isinstance(item, dict):
+                uid = item.get("user_id") or item.get("id")
+            else:
+                uid = item
+            if uid:
+                first_uid = str(uid).strip()
+                if first_uid:
+                    break
+
+    nick = None
+    start_str = "unknown"
+    end_str = "unknown"
+
+    if first_uid:
+        # 从 SQLite user 表获取昵称
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT nick_name FROM user WHERE id = ?", (first_uid,))
+            row = cur.fetchone()
+            if row and row[0]:
+                nick = str(row[0])
+        except Exception as e:
+            logger.warning("获取任务 %s 用户昵称失败: %s", task_id, e)
+        finally:
+            try:
+                conn.close()  # type: ignore[name-defined]
+            except Exception:
+                pass
+
+        # 从 weibo 表计算该用户的最早 / 最晚微博日期
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT MIN(created_at), MAX(created_at) FROM weibo WHERE user_id = ?",
+                (first_uid,),
+            )
+            row = cur.fetchone()
+            if row:
+                if row[0]:
+                    start_str = str(row[0]).split(" ")[0]
+                if row[1]:
+                    end_str = str(row[1]).split(" ")[0]
+        except Exception as e:
+            logger.warning("计算任务 %s 的开始/结束日期失败: %s", task_id, e)
+        finally:
+            try:
+                conn.close()  # type: ignore[name-defined]
+            except Exception:
+                pass
+
+    if not nick:
+        nick = first_uid or "task"
+
+    safe_nick = re.sub(r'[\\/:*?"<>|]', "_", str(nick))
+    task_prefix = str(task_id)[:5]
+    zip_name = f"{safe_nick}_{start_str}_{end_str}_{task_prefix}.zip"
+
+    # 将该任务的 weibo 目录打包为 zip 并返回
     import tempfile
     import shutil
 
@@ -971,8 +1037,12 @@ def download_task_weibo(task_id):
             return html, 500
         return jsonify(data), 500
 
-    download_name = f"weibo_{task_id}.zip"
-    return send_file(zip_path, as_attachment=True, download_name=download_name, mimetype="application/zip")
+    return send_file(
+        zip_path,
+        as_attachment=True,
+        download_name=zip_name,
+        mimetype="application/zip",
+    )
 
 @app.route('/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):
