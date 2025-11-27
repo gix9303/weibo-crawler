@@ -31,6 +31,7 @@ from util import csvutil
 from util.dateutil import convert_to_days_ago
 from util.notify import push_deer
 from util.llm_analyzer import LLMAnalyzer  # 导入 LLM 分析器
+from util.pdf_exporter import WeiboPdfExporter  # 导出 PDF 所需
 
 warnings.filterwarnings("ignore")
 
@@ -2538,6 +2539,27 @@ class Weibo(object):
 
                 # 当前用户所有微博和评论抓取完毕后，再导出该用户的评论 CSV
                 self.export_comments_to_csv_for_current_user()
+
+                # 在 CSV 写入 weibo 目录后，继续导出当前用户的 PDF 到 weibo 目录
+                # PDF 内容基于 SQLite 中的用户与微博+评论数据
+                try:
+                    if "sqlite" in self.write_mode:
+                        db_path = Path(self.get_sqlte_path())
+                        pdf_exporter = WeiboPdfExporter(db_path=db_path)
+                        pdf_path = pdf_exporter.export_user_timeline(
+                            user_id=str(user_config["user_id"]), output_path=None
+                        )
+                        logger.info(
+                            "已为用户 %s 导出 PDF，路径: %s",
+                            user_config["user_id"],
+                            pdf_path,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "为用户 %s 导出 PDF 失败: %s",
+                        user_config.get("user_id"),
+                        e,
+                    )
 
                 logger.info("信息抓取完毕")
                 logger.info("*" * 100)
