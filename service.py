@@ -50,6 +50,42 @@ def wants_html() -> bool:
     return False
 
 
+def _truncate_middle(text: str, max_len: int = 80) -> str:
+    """
+    将过长的字符串中间用 ... 代替，避免表格太宽。
+    例如：abcdef...uvwxyz
+    """
+    if text is None:
+        return ""
+    s = str(text)
+    if len(s) <= max_len:
+        return s
+    keep = max_len - 3
+    head = keep // 2
+    tail = keep - head
+    return s[:head] + "..." + s[-tail:]
+
+
+def _is_link_field(field_name: str) -> bool:
+    """
+    判断字段名是否为链接类字段，在 HTML 展示中可隐藏。
+    规则：
+    - 显式列出的若干字段：pics, video_url, live_photo_url 等
+    - 以 _url 或 _urls 结尾的字段
+    """
+    name = (field_name or "").lower()
+    explicit = {
+        "pics",
+        "video_url",
+        "live_photo_url",
+    }
+    if name in explicit:
+        return True
+    if name.endswith("_url") or name.endswith("_urls"):
+        return True
+    return False
+
+
 @app.route('/', methods=['GET'])
 def index():
     """根路径：列出所有可用接口及说明"""
@@ -973,6 +1009,46 @@ def get_task_status(task_id):
             rows.append(
                 f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
             )
+        # 计算上一条 / 下一条任务（按 created_at 倒序排列）
+        prev_task_id = None
+        next_task_id = None
+        created_at = task.get("created_at") or ""
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            # 上一条：比当前 created_at 更晚的那条中最早的（相当于列表中的上一条）
+            cur.execute(
+                """
+                SELECT task_id FROM tasks
+                WHERE created_at > ?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (created_at,),
+            )
+            row = cur.fetchone()
+            if row:
+                prev_task_id = row[0]
+            # 下一条：比当前 created_at 更早的那条中最新的（相当于列表中的下一条）
+            cur.execute(
+                """
+                SELECT task_id FROM tasks
+                WHERE created_at < ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (created_at,),
+            )
+            row = cur.fetchone()
+            if row:
+                next_task_id = row[0]
+        except Exception as e:
+            logger.warning("计算任务 %s 的前后任务失败: %s", task_id, e)
+        finally:
+            try:
+                conn.close()  # type: ignore[name-defined]
+            except Exception:
+                pass
         # 如果任务成功完成，提供下载 weibo 目录内容的链接
         download_link_html = ""
         if task.get('state') == 'SUCCESS':
@@ -995,16 +1071,29 @@ def get_task_status(task_id):
             notice_html = (
                 f"<p style='color:red;'>任务 {escape(task_id)} 已终止</p>"
             )
+        # 上一条 / 下一条任务的导航链接（仅在存在时显示）
+        nav_links = []
+        if prev_task_id:
+            nav_links.append(
+                f"<a href=\"/task/{escape(str(prev_task_id))}\">上一条任务</a>"
+            )
+        if next_task_id:
+            nav_links.append(
+                f"<a href=\"/task/{escape(str(next_task_id))}\">下一条任务</a>"
+            )
+        nav_html = " | ".join(nav_links) if nav_links else ""
+        nav_block = f"<p>{nav_html}</p>" if nav_html else ""
         html = f"""
         <html>
           <head><meta charset="utf-8"><title>任务详情 {escape(task_id)}</title></head>
-          <body>
+            <body>
             <h1>任务详情</h1>
             {notice_html}
             <table border="1" cellspacing="0" cellpadding="4">
               {''.join(rows)}
             </table>
             {download_link_html}
+            {nav_block}
             <p>{stop_button_html}<a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
           </body>
         </html>
@@ -1269,25 +1358,35 @@ def get_weibos():
             weibos.append(weibo)
         conn.close()
         if wants_html():
-            # 简单表格展示所有字段，其中 id 列可点击跳转到 /weibos/<weibo_id>
-            header_cells = "".join(f"<th>{escape(str(col))}</th>" for col in columns)
+            # 简单表格展示主要字段，其中 id 列可点击跳转到 /weibos/<weibo_id>
+            # 为了减少横向滚动，超长字段中间用 "..." 截断，并通过 title 展示完整内容。
+            display_columns = [col for col in columns if not _is_link_field(col)]
+            header_cells = "".join(f"<th>{escape(str(col))}</th>" for col in display_columns)
             body_rows = []
             for item in weibos:
                 row_cells = []
-                for col in columns:
+                for col in display_columns:
                     val = item.get(col)
+                    text = "" if val is None else str(val)
+                    # id 列仍然完整展示，但通常长度较短
                     if col == "id":
                         cell = (
-                            f"<td><a href=\"/weibos/{escape(str(val))}\">"
-                            f"{escape(str(val))}</a></td>"
+                            f"<td><a href=\"/weibos/{escape(text)}\">"
+                            f"{escape(text)}</a></td>"
                         )
                     else:
-                        cell = f"<td>{escape(str(val))}</td>"
+                        short = _truncate_middle(text, max_len=80)
+                        title_attr = f' title="{escape(text)}"' if text else ""
+                        cell = (
+                            f"<td{title_attr}>{escape(short)}</td>"
+                        )
                     row_cells.append(cell)
                 body_rows.append("<tr>" + "".join(row_cells) + "</tr>")
             html = f"""
             <html>
-              <head><meta charset="utf-8"><title>微博列表</title></head>
+              <head>
+                <meta charset="utf-8"><title>微博列表</title>
+              </head>
               <body>
                 <h1>微博列表</h1>
                 <table border="1" cellspacing="0" cellpadding="4">
@@ -1296,6 +1395,7 @@ def get_weibos():
                     {''.join(body_rows)}
                   </tbody>
                 </table>
+                <p>说明：为避免页面过宽，长文本中间已使用 "..." 截断，鼠标悬停可查看完整内容。</p>
                 <p><a href=\"/\">返回首页</a></p>
               </body>
             </html>
@@ -1316,31 +1416,8 @@ def get_weibo_detail(weibo_id):
         cursor.execute("SELECT * FROM weibo WHERE id=?", (weibo_id,))
         columns = [column[0] for column in cursor.description]
         row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            weibo = dict(zip(columns, row))
-            if wants_html():
-                rows = []
-                for k, v in weibo.items():
-                    rows.append(
-                        f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
-                    )
-                html = f"""
-                <html>
-                  <head><meta charset="utf-8"><title>微博详情 {escape(str(weibo_id))}</title></head>
-                  <body>
-                    <h1>微博详情</h1>
-                    <table border="1" cellspacing="0" cellpadding="4">
-                      {''.join(rows)}
-                    </table>
-                    <p><a href=\"/weibos\">返回微博列表</a> | <a href=\"/\">返回首页</a></p>
-                  </body>
-                </html>
-                """
-                return html, 200
-            return jsonify(weibo), 200
-        else:
+        if not row:
+            conn.close()
             data = {"error": "Weibo not found"}
             if wants_html():
                 html = f"""
@@ -1357,6 +1434,86 @@ def get_weibo_detail(weibo_id):
                 """
                 return html, 404
             return data, 404
+
+        weibo = dict(zip(columns, row))
+
+        # 计算上一条 / 下一条微博（按 created_at DESC 排序）
+        prev_weibo_id = None
+        next_weibo_id = None
+        created_at = weibo.get("created_at") or ""
+        try:
+            # 上一条：比当前 created_at 更晚的一条（列表中的上一条）
+            cursor.execute(
+                """
+                SELECT id FROM weibo
+                WHERE created_at > ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (created_at,),
+            )
+            r = cursor.fetchone()
+            if r:
+                prev_weibo_id = r[0]
+            # 下一条：比当前 created_at 更早的一条（列表中的下一条）
+            cursor.execute(
+                """
+                SELECT id FROM weibo
+                WHERE created_at < ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (created_at,),
+            )
+            r = cursor.fetchone()
+            if r:
+                next_weibo_id = r[0]
+        except Exception as e:
+            logger.warning("计算微博 %s 的前后微博失败: %s", weibo_id, e)
+        finally:
+            conn.close()
+        
+        if wants_html():
+            rows = []
+            for k, v in weibo.items():
+                # pics、video_url 等链接类字段在 HTML 页面上不展示
+                if _is_link_field(k):
+                    continue
+                text = "" if v is None else str(v)
+                short = _truncate_middle(text, max_len=120)
+                title_attr = f' title="{escape(text)}"' if text else ""
+                rows.append(
+                    f"<tr><th>{escape(str(k))}</th><td{title_attr}>{escape(short)}</td></tr>"
+                )
+
+            # 上一条 / 下一条微博导航（仅在存在时显示）
+            nav_links = []
+            if prev_weibo_id:
+                nav_links.append(
+                    f"<a href=\"/weibos/{escape(str(prev_weibo_id))}\">上一条微博</a>"
+                )
+            if next_weibo_id:
+                nav_links.append(
+                    f"<a href=\"/weibos/{escape(str(next_weibo_id))}\">下一条微博</a>"
+                )
+            nav_html = " | ".join(nav_links) if nav_links else ""
+            nav_block = f"<p>{nav_html}</p>" if nav_html else ""
+
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>微博详情 {escape(str(weibo_id))}</title></head>
+              <body>
+                <h1>微博详情</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  {''.join(rows)}
+                </table>
+                {nav_block}
+                <p><a href=\"/weibos\">返回微博列表</a> | <a href=\"/\">返回首页</a></p>
+              </body>
+            </html>
+            """
+            return html, 200
+        return jsonify(weibo), 200
     except Exception as e:
         logger.exception(e)
         return {"error": str(e)}, 500
