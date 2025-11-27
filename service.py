@@ -419,6 +419,8 @@ def run_refresh_task(task_id, user_id_list=None):
         db_update_task(task_id, state="PROGRESS", progress=0, command="RUNNING")
 
         config = get_config(user_id_list)
+        # 将当前任务 ID 传给 Weibo，用于隔离输出目录 weibo/<task_id>/
+        config["task_id"] = task_id
         wb = Weibo(config)
 
         # 设置进度回调：由 Weibo 内部按“用户数 + 每个用户的分页”计算整体百分比
@@ -921,9 +923,11 @@ def download_task_weibo(task_id):
         return jsonify({"error": msg, "state": task.get("state")}), 400
 
     base_dir = os.path.split(os.path.realpath(__file__))[0]
-    weibo_dir = os.path.join(base_dir, "weibo")
-    if not os.path.isdir(weibo_dir):
-        data = {"error": f"weibo 目录不存在: {weibo_dir}"}
+    weibo_root = os.path.join(base_dir, "weibo")
+    # 仅打包该任务专属目录 weibo/<task_id>/；如果不存在则直接报错，不再回退打包整个 weibo 目录
+    task_weibo_dir = os.path.join(weibo_root, task_id)
+    if not os.path.isdir(task_weibo_dir):
+        data = {"error": f"未找到该任务对应的结果目录: {task_weibo_dir}"}
         if wants_html():
             html = f"""
             <html>
@@ -947,7 +951,7 @@ def download_task_weibo(task_id):
     tmp_dir = tempfile.gettempdir()
     archive_base = os.path.join(tmp_dir, f"weibo_{task_id}")
     try:
-        zip_path = shutil.make_archive(archive_base, "zip", weibo_dir)
+        zip_path = shutil.make_archive(archive_base, "zip", task_weibo_dir)
     except Exception as e:
         logger.exception("打包 weibo 目录失败: %s", e)
         data = {"error": f"打包 weibo 目录失败: {e}"}

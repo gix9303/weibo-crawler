@@ -136,6 +136,8 @@ class Weibo(object):
         self.mongodb_URI = config.get("mongodb_URI")  # MongoDB数据库连接字符串，可以不填
         self.post_config = config.get("post_config")  # post_config，可以不填
         self.page_weibo_count = config.get("page_weibo_count")  # page_weibo_count，爬取一页的微博数，默认10页
+        # 当前任务ID（由 service.py 在以 Web 方式运行时传入），用于隔离每个任务的输出目录
+        self.task_id = config.get("task_id")
         
         # 初始化 LLM 分析器
         self.llm_analyzer = LLMAnalyzer(config) if config.get("llm_config") else None
@@ -1614,13 +1616,18 @@ class Weibo(object):
             dir_name = self.user["screen_name"]
             if self.user_id_as_folder_name:
                 dir_name = str(self.user_config["user_id"])
-            file_dir = (
-                os.path.split(os.path.realpath(__file__))[0]
-                + os.sep
-                + "weibo"
-                + os.sep
-                + dir_name
-            )
+            base_dir = os.path.split(os.path.realpath(__file__))[0] + os.sep + "weibo"
+            # 如果存在任务 ID，则为每个任务单独创建一级目录：weibo/<task_id>/<user_dir>/
+            if getattr(self, "task_id", None):
+                file_dir = (
+                    base_dir
+                    + os.sep
+                    + str(self.task_id)
+                    + os.sep
+                    + dir_name
+                )
+            else:
+                file_dir = base_dir + os.sep + dir_name
             if type in ["img", "video", "live_photo"]:
                 file_dir = file_dir + os.sep + type
             if not os.path.isdir(file_dir):
@@ -2546,8 +2553,30 @@ class Weibo(object):
                     if "sqlite" in self.write_mode:
                         db_path = Path(self.get_sqlte_path())
                         pdf_exporter = WeiboPdfExporter(db_path=db_path)
+
+                        # 目标 PDF 目录：weibo/<task_id>/ 或 weibo/（无任务ID时）
+                        base_weibo_dir = (
+                            Path(os.path.split(os.path.realpath(__file__))[0])
+                            / "weibo"
+                        )
+                        if getattr(self, "task_id", None):
+                            pdf_dir = base_weibo_dir / str(self.task_id)
+                        else:
+                            pdf_dir = base_weibo_dir
+                        pdf_dir.mkdir(parents=True, exist_ok=True)
+
+                        # 文件名：<nick>_<since_date>_<end_date>.pdf
+                        nick = self.user.get("screen_name") or user_config["user_id"]
+                        safe_nick = re.sub(r'[\\/:*?"<>|]', "_", str(nick))
+                        since_token = user_config.get("since_date") or ""
+                        end_token = user_config.get("end_date") or ""
+                        since_str = str(since_token).split("T")[0] if since_token else "unknown"
+                        end_str = str(end_token).split("T")[0] if end_token else "unknown"
+                        pdf_name = f"{safe_nick}_{since_str}_{end_str}.pdf"
+                        pdf_path = pdf_dir / pdf_name
+
                         pdf_path = pdf_exporter.export_user_timeline(
-                            user_id=str(user_config["user_id"]), output_path=None
+                            user_id=str(user_config["user_id"]), output_path=pdf_path
                         )
                         logger.info(
                             "已为用户 %s 导出 PDF，路径: %s",
