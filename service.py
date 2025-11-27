@@ -81,44 +81,224 @@ def index():
 
 # 添加线程池和任务状态跟踪
 executor = ThreadPoolExecutor(max_workers=1)  # 限制只有1个worker避免并发爬取
-tasks = {}  # 存储任务状态
 
-# 在executor定义后添加任务锁相关变量
-current_task_id = None
-task_lock = threading.Lock()
+# 使用 SQLite 持久化任务列表，仅用少量内存变量做并发控制
+current_task_id = None  # 当前正在后台执行的任务 ID
+task_lock = threading.Lock()  # 防止同时创建/修改 current_task_id
+
+
+def _init_tasks_table():
+    """初始化 tasks 表，用于持久化任务列表。"""
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id      TEXT PRIMARY KEY,
+                state        TEXT,
+                progress     INTEGER,
+                created_at   TEXT,
+                user_id_list TEXT,
+                command      TEXT,
+                error        TEXT,
+                result       TEXT
+            )
+            """
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("初始化任务表失败: %s", e)
+    finally:
+        if conn:
+            conn.close()
+
+
+_init_tasks_table()
 
 
 class TaskStopped(Exception):
     """用户请求停止当前任务时抛出的异常，用于优雅退出。"""
     pass
 
+def _row_to_task(row):
+    """将 tasks 表中的一行转换为字典。"""
+    if not row:
+        return None
+    (
+        task_id,
+        state,
+        progress,
+        created_at,
+        user_id_json,
+        command,
+        error,
+        result,
+    ) = row
+    user_id_list = None
+    if user_id_json:
+        try:
+            user_id_list = json.loads(user_id_json)
+        except Exception:
+            user_id_list = user_id_json
+    return {
+        "task_id": task_id,
+        "state": state,
+        "progress": progress if progress is not None else 0,
+        "created_at": created_at,
+        "user_id_list": user_id_list,
+        "command": command,
+        "error": error,
+        "result": result,
+    }
+
+
+def db_create_task(task_id: str, user_id_list):
+    """在数据库中创建一条新任务记录，初始为 PENDING。"""
+    user_id_json = None
+    if user_id_list is not None:
+        try:
+            user_id_json = json.dumps(user_id_list, ensure_ascii=False)
+        except Exception:
+            user_id_json = str(user_id_list)
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO tasks (task_id, state, progress, created_at, user_id_list, command)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                "PENDING",
+                0,
+                datetime.now().isoformat(),
+                user_id_json,
+                "RUNNING",
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.warning("创建任务记录失败: %s", e)
+    finally:
+        if conn:
+            conn.close()
+
+
+def db_update_task(task_id: str, **fields):
+    """更新任务记录中的指定字段。"""
+    if not fields:
+        return
+    allowed = {"state", "progress", "created_at", "user_id_list", "command", "error", "result"}
+    sets = []
+    params = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k == "user_id_list" and v is not None:
+            try:
+                v = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                v = str(v)
+        if k == "result" and isinstance(v, (dict, list)):
+            try:
+                v = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                v = str(v)
+        sets.append(f"{k} = ?")
+        params.append(v)
+    if not sets:
+        return
+    params.append(task_id)
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        sql = f"UPDATE tasks SET {', '.join(sets)} WHERE task_id = ?"
+        cur.execute(sql, params)
+        conn.commit()
+    except Exception as e:
+        logger.warning("更新任务 %s 失败: %s", task_id, e)
+    finally:
+        if conn:
+            conn.close()
+
+
+def db_get_task(task_id: str):
+    """从数据库获取单个任务字典。"""
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            FROM tasks WHERE task_id = ?
+            """,
+            (task_id,),
+        )
+        row = cur.fetchone()
+        return _row_to_task(row)
+    except Exception as e:
+        logger.warning("查询任务 %s 失败: %s", task_id, e)
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
 def get_running_task():
     """
     获取当前运行的任务信息。
-    优先使用 current_task_id，如果丢失则从 tasks 中扫描处于运行中的任务。
+    优先使用 current_task_id，如果丢失则从 tasks 表中扫描处于运行中的任务。
     """
-    # 先尝试用 current_task_id
-    with task_lock:
-        cid = current_task_id
-        if cid and cid in tasks:
-            task = tasks[cid]
-            if task.get('state') in ['PENDING', 'PROGRESS']:
-                return cid, task
+    conn = None
+    try:
+        # 先尝试用 current_task_id
+        with task_lock:
+            cid = current_task_id
+
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+
+        if cid:
+            cur.execute(
+                """
+                SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+                FROM tasks
+                WHERE task_id = ? AND state IN ('PENDING', 'PROGRESS')
+                """,
+                (cid,),
+            )
+            row = cur.fetchone()
+            if row:
+                task = _row_to_task(row)
+                return task["task_id"], task
 
         # 回退：从所有任务中找出正在运行的任务（按创建时间倒序，取最新）
-        running = []
-        for tid, t in tasks.items():
-            if t.get('state') in ['PENDING', 'PROGRESS']:
-                running.append((tid, t))
-
-    if not running:
+        cur.execute(
+            """
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            FROM tasks
+            WHERE state IN ('PENDING', 'PROGRESS')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        task = _row_to_task(row)
+        return task["task_id"], task
+    except Exception as e:
+        logger.warning("获取当前运行任务失败: %s", e)
         return None, None
-
-    running.sort(
-        key=lambda x: x[1].get('created_at') or "",
-        reverse=True,
-    )
-    return running[0]
+    finally:
+        if conn:
+            conn.close()
 
 def get_config(user_id_list=None):
     """
@@ -191,10 +371,8 @@ def run_refresh_task(task_id, user_id_list=None):
     global current_task_id
     config = None  # 确保异常路径中也能安全引用
     try:
-        tasks[task_id]["state"] = "PROGRESS"
-        tasks[task_id]["progress"] = 0
-        # 任务开始时将命令标记为 RUNNING
-        tasks[task_id]["command"] = "RUNNING"
+        # 任务开始时更新数据库状态为 PROGRESS
+        db_update_task(task_id, state="PROGRESS", progress=0, command="RUNNING")
 
         config = get_config(user_id_list)
         wb = Weibo(config)
@@ -206,17 +384,23 @@ def run_refresh_task(task_id, user_id_list=None):
             except Exception:
                 pct = 0
             pct = max(0, min(100, pct))
-            tasks[task_id]["progress"] = pct
+            db_update_task(task_id, progress=pct)
 
         wb.set_progress_callback(progress_cb)
 
-        # 设置停止检查回调：当 tasks[task_id]['command'] == 'STOP' 时抛出 TaskStopped
+        # 设置停止检查回调：当数据库中的 command == 'STOP' 时抛出 TaskStopped
         def stop_checker():
-            task = tasks.get(task_id)
-            if not task:
-                return
-            if task.get("command") == "STOP":
-                raise TaskStopped("任务已被用户停止")
+            conn = None
+            try:
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                cur.execute("SELECT command FROM tasks WHERE task_id = ?", (task_id,))
+                row = cur.fetchone()
+                if row and row[0] == "STOP":
+                    raise TaskStopped("任务已被用户停止")
+            finally:
+                if conn:
+                    conn.close()
 
         wb.set_stop_checker(stop_checker)
 
@@ -225,10 +409,13 @@ def run_refresh_task(task_id, user_id_list=None):
             wb.start()  # 爬取微博信息
         except TaskStopped as ts:
             # 用户主动停止视为“失败”状态，并将进度归零，不再执行后续的成功逻辑和 config.json 写回
-            tasks[task_id]["state"] = "FAILED"
-            tasks[task_id]["error"] = str(ts) or "任务已被用户停止"
-            tasks[task_id]["progress"] = 0
-            tasks[task_id]["command"] = "FINISHED"
+            db_update_task(
+                task_id,
+                state="FAILED",
+                error=str(ts) or "任务已被用户停止",
+                progress=0,
+                command="FINISHED",
+            )
             logger.info("任务 %s 已被用户停止", task_id)
             # 发送 PushDeer 通知：任务被停止
             try:
@@ -275,10 +462,13 @@ def run_refresh_task(task_id, user_id_list=None):
         except Exception as cfg_err:
             logger.warning("更新 config.json 中 end_date 失败: %s", cfg_err)
 
-        tasks[task_id]["progress"] = 100
-        tasks[task_id]["state"] = "SUCCESS"
-        tasks[task_id]["result"] = {"message": "微博列表已刷新"}
-        tasks[task_id]["command"] = "FINISHED"
+        db_update_task(
+            task_id,
+            progress=100,
+            state="SUCCESS",
+            result="微博列表已刷新",
+            command="FINISHED",
+        )
 
         # 任务成功完成后发送 PushDeer 通知
         try:
@@ -289,9 +479,12 @@ def run_refresh_task(task_id, user_id_list=None):
             logger.warning("发送 PushDeer 成功通知失败: %s", notify_err)
 
     except Exception as e:
-        tasks[task_id]["state"] = "FAILED"
-        tasks[task_id]["error"] = str(e)
-        tasks[task_id]["command"] = "FINISHED"
+        db_update_task(
+            task_id,
+            state="FAILED",
+            error=str(e),
+            command="FINISHED",
+        )
         logger.exception(e)
         # 任务失败时也发送 PushDeer 通知
         try:
@@ -560,14 +753,7 @@ def refresh():
         with task_lock:
             logger.info("refresh POST: acquiring task_lock to start task")
             task_id = str(uuid.uuid4())
-            tasks[task_id] = {
-                "state": "PENDING",
-                "progress": 0,
-                "created_at": datetime.now().isoformat(),
-                "user_id_list": user_id_list,
-                # command 用于控制任务状态（例如 STOP）
-                "command": "RUNNING",
-            }
+            db_create_task(task_id, user_id_list)
             current_task_id = task_id
 
         # 提交任务，传入 None，让 run_refresh_task 自行通过 get_config 读取最新配置
@@ -586,9 +772,9 @@ def refresh():
 def stop_task(task_id):
     """
     停止指定任务（方案1：仅支持“停止”，不支持继续/恢复）。
-    通过将 tasks[task_id]['command'] 置为 'STOP'，让后台线程在安全检查点优雅退出。
+    通过将数据库中该任务的 command 置为 'STOP'，让后台线程在安全检查点优雅退出。
     """
-    task = tasks.get(task_id)
+    task = db_get_task(task_id)
     if not task:
         data = {"error": "Task not found"}
         if wants_html():
@@ -630,8 +816,7 @@ def stop_task(task_id):
 
     # 标记为 STOP，后台线程会在合适的检查点抛出 TaskStopped 结束任务
     with task_lock:
-        if task_id in tasks:
-            tasks[task_id]["command"] = "STOP"
+        db_update_task(task_id, command="STOP")
 
     if wants_html():
         # 根据来源页面决定跳转位置：从任务列表来就回到列表，从状态页来就回到状态页，
@@ -648,7 +833,7 @@ def stop_task(task_id):
 
 @app.route('/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):
-    task = tasks.get(task_id)
+    task = db_get_task(task_id)
     if not task:
         data = {'error': 'Task not found'}
         if wants_html():
@@ -728,24 +913,47 @@ def list_tasks():
     # 如果是 POST 并且带有删除参数，则删除指定任务后重定向
     if request.method == 'POST':
         task_id = request.form.get('task_id')
-        if task_id and task_id in tasks:
+        if task_id:
             # 仅删除非运行中任务
-            if tasks[task_id].get('state') not in ['PENDING', 'PROGRESS']:
-                tasks.pop(task_id, None)
+            conn = None
+            try:
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                cur.execute("SELECT state FROM tasks WHERE task_id = ?", (task_id,))
+                row = cur.fetchone()
+                if row and row[0] not in ['PENDING', 'PROGRESS']:
+                    cur.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+                    conn.commit()
+            except Exception as e:
+                logger.warning("删除任务 %s 失败: %s", task_id, e)
+            finally:
+                if conn:
+                    conn.close()
         return redirect('/tasks')
 
-    # GET：将 tasks 按 created_at 逆序排序
+    # GET：从数据库按 created_at 逆序读取所有任务
     items = []
-    for tid, t in tasks.items():
-        items.append({
-            'task_id': tid,
-            'state': t.get('state'),
-            'progress': t.get('progress'),
-            'created_at': t.get('created_at'),
-            'user_id_list': t.get('user_id_list'),
-            'command': t.get('command'),
-        })
-    items.sort(key=lambda x: x.get('created_at') or "", reverse=True)
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            FROM tasks
+            ORDER BY created_at DESC
+            """
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            t = _row_to_task(row)
+            if t:
+                items.append(t)
+    except Exception as e:
+        logger.warning("查询任务列表失败: %s", e)
+    finally:
+        if conn:
+            conn.close()
     if wants_html():
         # 如果通过 stopped 参数传入任务ID，则在页面上给出“任务已终止”的提示
         notice_html = ""
@@ -869,25 +1077,33 @@ def get_current_status():
         return jsonify(data), 200
 
     # 没有正在运行的任务，尝试给出最近一个任务的简要信息（如果有）
-    last_task_id = None
     last_task = None
-    for tid, t in tasks.items():
-        if last_task is None:
-            last_task_id, last_task = tid, t
-            continue
-        try:
-            ts_new = t.get('created_at') or ''
-            ts_old = last_task.get('created_at') or ''
-            if ts_new > ts_old:
-                last_task_id, last_task = tid, t
-        except Exception:
-            continue
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            FROM tasks
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            last_task = _row_to_task(row)
+    except Exception as e:
+        logger.warning("查询最近任务失败: %s", e)
+    finally:
+        if conn:
+            conn.close()
 
     if last_task:
         data = {
             'state': 'IDLE',
             'current_task': None,
-            'last_task_id': last_task_id,
+            'last_task_id': last_task.get('task_id'),
             'last_state': last_task.get('state'),
             'last_progress': last_task.get('progress'),
             'last_created_at': last_task.get('created_at'),
