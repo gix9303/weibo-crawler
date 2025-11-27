@@ -43,8 +43,11 @@ def wants_html() -> bool:
         return False
     if fmt == "html":
         return True
-    best = request.accept_mimetypes.best
-    return best == "text/html"
+    # 简化逻辑：只要 Accept 头里包含 text/html，就认为是浏览器，返回 HTML
+    accept = request.headers.get("Accept", "")
+    if "text/html" in accept:
+        return True
+    return False
 
 
 @app.route('/', methods=['GET'])
@@ -425,6 +428,7 @@ def refresh():
 
     # --- POST：如果是表单提交，保存页面输入并启动任务 --------------------
     if not request.is_json:
+        logger.info("refresh POST: start form handling")
         # 读取原始配置
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -484,6 +488,7 @@ def refresh():
 
         # 写回 config.json
         try:
+            logger.info("refresh POST: writing config.json")
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=4)
         except Exception as e:
@@ -493,26 +498,30 @@ def refresh():
         action = form.get("action") or "save_and_run"
         if action == "save":
             # 仅保存配置，不启动任务，直接回到配置页
+            logger.info("refresh POST: save only, redirect to /refresh")
             return redirect("/refresh")
 
         # 启动任务，使用最新 config.json 中的 user_id_list
         user_id_list = cfg.get("user_id_list")
 
-        with task_lock:
-            running_task_id, running_task = get_running_task()
-            if running_task:
-                html = f"""
-                <html>
-                  <head><meta charset="utf-8"><title>任务已在运行</title></head>
-                  <body>
-                    <h1>已有任务正在运行</h1>
-                    <p>当前任务 ID：{escape(running_task_id)}</p>
-                    <p><a href="/status">查看当前状态</a> | <a href="/tasks">查看所有任务</a> | <a href="/">返回首页</a></p>
-                  </body>
-                </html>
-                """
-                return html, 409
+        # 先在锁外检查是否有正在运行的任务，避免死锁
+        running_task_id, running_task = get_running_task()
+        if running_task:
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>任务已在运行</title></head>
+              <body>
+                <h1>已有任务正在运行</h1>
+                <p>当前任务 ID：{escape(running_task_id)}</p>
+                <p><a href="/status">查看当前状态</a> | <a href="/tasks">查看所有任务</a> | <a href="/">返回首页</a></p>
+              </body>
+            </html>
+            """
+            return html, 409
 
+        # 创建新任务时加锁，防止竞态
+        with task_lock:
+            logger.info("refresh POST: acquiring task_lock to start task")
             task_id = str(uuid.uuid4())
             tasks[task_id] = {
                 'state': 'PENDING',
@@ -523,28 +532,12 @@ def refresh():
             current_task_id = task_id
 
         # 提交任务，传入 None，让 run_refresh_task 自行通过 get_config 读取最新配置
+        logger.info("refresh POST: submitting background task")
         executor.submit(run_refresh_task, task_id, None)
 
-        html = f"""
-        <html>
-          <head><meta charset="utf-8"><title>任务已启动</title></head>
-          <body>
-            <h1>任务已启动</h1>
-            <table border="1" cellspacing="0" cellpadding="4">
-              <tr><th>task_id</th><td><a href="/task/{escape(task_id)}">{escape(task_id)}</a></td></tr>
-              <tr><th>state</th><td>PENDING</td></tr>
-              <tr><th>progress</th><td>0</td></tr>
-              <tr><th>user_id_list</th><td>{escape(str(user_id_list))}</td></tr>
-            </table>
-            <p>
-              <a href="/status">查看当前状态</a> |
-              <a href="/tasks">查看所有任务</a> |
-              <a href="/">返回首页</a>
-            </p>
-          </body>
-        </html>
-        """
-        return html, 202
+        # 立即重定向到状态页，避免浏览器长时间等待
+        logger.info("refresh POST: redirecting to /status")
+        return redirect("/status")
 
     # 走到这里说明既不是 GET，也不是表单 POST，直接返回 400
     return "Unsupported request type for /refresh", 400
