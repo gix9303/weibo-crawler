@@ -1479,11 +1479,8 @@ def get_weibo_detail(weibo_id):
                 # pics、video_url 等链接类字段在 HTML 页面上不展示
                 if _is_link_field(k):
                     continue
-                text = "" if v is None else str(v)
-                short = _truncate_middle(text, max_len=120)
-                title_attr = f' title="{escape(text)}"' if text else ""
                 rows.append(
-                    f"<tr><th>{escape(str(k))}</th><td{title_attr}>{escape(short)}</td></tr>"
+                    f"<tr><th>{escape(str(k))}</th><td>{escape('' if v is None else str(v))}</td></tr>"
                 )
 
             # 上一条 / 下一条微博导航（仅在存在时显示）
