@@ -194,6 +194,8 @@ class Weibo(object):
         self.start_date = ""  # 获取当前用户本次抓取的起始时间
         # 可选的进度回调，用于向外部报告整体进度百分比 (0-100)
         self.progress_callback = None
+        # 可选的停止检查回调，被调用时若需要停止可抛出异常
+        self.stop_checker = None
         self.query = ""
         self.user = {}  # 存储目标微博用户信息
         self.got_count = 0  # 存储爬取到的微博数
@@ -324,6 +326,10 @@ class Weibo(object):
         """设置进度回调函数，签名为 callback(percent:int)，0-100。"""
         self.progress_callback = callback
 
+    def set_stop_checker(self, callback):
+        """设置停止检查回调，签名为 callback()，如需停止可在内部抛出异常。"""
+        self.stop_checker = callback
+
     def get_json(self, params):
         url = "https://m.weibo.cn/api/container/getIndex?"
         try:
@@ -395,6 +401,9 @@ class Weibo(object):
         backoff_factor = 5
 
         while retries < max_retries:
+            # 每次重试前先检查是否需要停止任务
+            if self.stop_checker:
+                self.stop_checker()
             try:
                 response = self.session.get(url, params=params, headers=self.headers, timeout=10)
                 response.raise_for_status()  # 如果响应状态码不是 200，会抛出 HTTPError
@@ -415,11 +424,17 @@ class Weibo(object):
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
                 logger.error(f"请求失败，错误信息：{e}。等待 {sleep_time} 秒后重试...")
+                # 进入长时间 sleep 前再次检查是否需要停止
+                if self.stop_checker:
+                    self.stop_checker()
                 sleep(sleep_time)
             except ValueError as ve:
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
                 logger.error(f"JSON 解码失败，错误信息：{ve}。等待 {sleep_time} 秒后重试...")
+                # 进入长时间 sleep 前再次检查是否需要停止
+                if self.stop_checker:
+                    self.stop_checker()
                 sleep(sleep_time)
         logger.error("超过最大重试次数，跳过当前页面。")
         return {}
@@ -541,9 +556,12 @@ class Weibo(object):
         if self.long_sleep_count_before_each_user > 0:
             sleep_time = random.randint(30, 60)
             # 添加log，否则一般用户不知道以为程序卡了
-            logger.info(f"""短暂sleep {sleep_time}秒，避免被ban""")        
+            logger.info(f"""短暂sleep {sleep_time}秒，避免被ban""")
+            # 长时间 sleep 前检查一次是否需要停止
+            if self.stop_checker:
+                self.stop_checker()
             sleep(sleep_time)
-            logger.info("sleep结束")  
+            logger.info("sleep结束")
         self.long_sleep_count_before_each_user = self.long_sleep_count_before_each_user + 1      
 
         max_retries = 5  # 设置最大重试次数，避免无限循环
@@ -551,6 +569,9 @@ class Weibo(object):
         backoff_factor = 5  # 指数退避的基数（秒）
         
         while retries < max_retries:
+            # 每次重试前先检查是否需要停止任务
+            if self.stop_checker:
+                self.stop_checker()
             try:
                 response = self.session.get(url, params=params, headers=self.headers, timeout=10)
                 response.raise_for_status()
@@ -621,11 +642,17 @@ class Weibo(object):
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
                 logger.error(f"请求失败，错误信息：{e}。等待 {sleep_time} 秒后重试...")
+                # 进入长时间 sleep 前再次检查是否需要停止
+                if self.stop_checker:
+                    self.stop_checker()
                 sleep(sleep_time)
             except ValueError as ve:
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
                 logger.error(f"JSON 解码失败，错误信息：{ve}。等待 {sleep_time} 秒后重试...")
+                # 进入长时间 sleep 前再次检查是否需要停止
+                if self.stop_checker:
+                    self.stop_checker()
                 sleep(sleep_time)
         logger.error("超过最大重试次数，程序将退出。")
         sys.exit("超过最大重试次数，程序已退出。")
@@ -1526,6 +1553,9 @@ class Weibo(object):
                 )
             )
         except Exception as e:
+            # 用户主动停止任务时直接向上抛出，让外层统一处理
+            if e.__class__.__name__ == "TaskStopped":
+                raise
             logger.exception(e)
 
     def get_page_count(self):
@@ -1706,6 +1736,9 @@ class Weibo(object):
             'api-token': f'{token}',
         }
         for attempt in range(max_retries + 1):
+            # 每次尝试前检查是否需要停止任务
+            if self.stop_checker:
+                self.stop_checker()
             try:
                 response = self.session.get(url, json=data, headers=headers)
                 if response.status_code == requests.codes.ok:
@@ -1714,6 +1747,9 @@ class Weibo(object):
                     raise RequestException(f"Unexpected response status: {response.status_code}")
             except RequestException as e:
                 if attempt < max_retries:
+                    # 进入等待前再次检查是否需要停止
+                    if self.stop_checker:
+                        self.stop_checker()
                     sleep(backoff_factor * (attempt + 1))  # 逐步增加等待时间，避免频繁重试
                     continue
                 else:
@@ -2428,6 +2464,9 @@ class Weibo(object):
                 pages = range(self.start_page, page_count + 1)
 
                 for idx, page in enumerate(tqdm(pages, desc="Progress"), start=1):
+                    # 每页开始前检查是否需要停止
+                    if self.stop_checker:
+                        self.stop_checker()
                     is_end = self.get_one_page(page)
 
                     # page 级进度更新：以用户为单位，对总任务进度加权
@@ -2452,6 +2491,9 @@ class Weibo(object):
                     # 制会自动解除)，加入随机等待模拟人的操作，可降低被系统限制的风险。默
                     # 认是每爬取1到5页随机等待6到10秒，如果仍然被限，可适当增加sleep时间
                     if (page - page1) % random_pages == 0 and page < page_count:
+                        # 随机等待前也检查一次是否需要停止
+                        if self.stop_checker:
+                            self.stop_checker()
                         sleep(random.randint(6, 10))
                         page1 = page
                         random_pages = random.randint(1, 5)
@@ -2459,6 +2501,9 @@ class Weibo(object):
                 self.write_data(wrote_count)  # 将剩余不足20页的微博写入文件
             logger.info("微博爬取完成，共爬取%d条微博", self.got_count)
         except Exception as e:
+            # 用户主动停止任务时直接向上抛出，让外层统一处理
+            if e.__class__.__name__ == "TaskStopped":
+                raise
             logger.exception(e)
 
     def initialize_info(self, user_config):
@@ -2504,6 +2549,9 @@ class Weibo(object):
                     except Exception as cb_err:
                         logger.warning("进度回调执行失败: %s", cb_err)
         except Exception as e:
+            # 用户主动停止任务时，不再输出“信息抓取完毕”，改由上层记录“任务已被用户停止”
+            if e.__class__.__name__ == "TaskStopped":
+                raise
             logger.exception(e)
 
 

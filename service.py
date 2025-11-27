@@ -87,6 +87,11 @@ tasks = {}  # 存储任务状态
 current_task_id = None
 task_lock = threading.Lock()
 
+
+class TaskStopped(Exception):
+    """用户请求停止当前任务时抛出的异常，用于优雅退出。"""
+    pass
+
 def get_running_task():
     """
     获取当前运行的任务信息。
@@ -184,10 +189,13 @@ def _resolve_user_names_for_notification(config: dict) -> str:
 
 def run_refresh_task(task_id, user_id_list=None):
     global current_task_id
+    config = None  # 确保异常路径中也能安全引用
     try:
-        tasks[task_id]['state'] = 'PROGRESS'
-        tasks[task_id]['progress'] = 0
-        
+        tasks[task_id]["state"] = "PROGRESS"
+        tasks[task_id]["progress"] = 0
+        # 任务开始时将命令标记为 RUNNING
+        tasks[task_id]["command"] = "RUNNING"
+
         config = get_config(user_id_list)
         wb = Weibo(config)
 
@@ -198,11 +206,38 @@ def run_refresh_task(task_id, user_id_list=None):
             except Exception:
                 pct = 0
             pct = max(0, min(100, pct))
-            tasks[task_id]['progress'] = pct
+            tasks[task_id]["progress"] = pct
 
         wb.set_progress_callback(progress_cb)
-        
-        wb.start()  # 爬取微博信息
+
+        # 设置停止检查回调：当 tasks[task_id]['command'] == 'STOP' 时抛出 TaskStopped
+        def stop_checker():
+            task = tasks.get(task_id)
+            if not task:
+                return
+            if task.get("command") == "STOP":
+                raise TaskStopped("任务已被用户停止")
+
+        wb.set_stop_checker(stop_checker)
+
+        # 启动爬虫；如果中途被 stop_checker 中断，会抛出 TaskStopped 异常
+        try:
+            wb.start()  # 爬取微博信息
+        except TaskStopped as ts:
+            # 用户主动停止视为“失败”状态，并将进度归零，不再执行后续的成功逻辑和 config.json 写回
+            tasks[task_id]["state"] = "FAILED"
+            tasks[task_id]["error"] = str(ts) or "任务已被用户停止"
+            tasks[task_id]["progress"] = 0
+            tasks[task_id]["command"] = "FINISHED"
+            logger.info("任务 %s 已被用户停止", task_id)
+            # 发送 PushDeer 通知：任务被停止
+            try:
+                if config and const.NOTIFY.get("NOTIFY"):
+                    name_str = _resolve_user_names_for_notification(config) or "未知用户"
+                    push_deer(f"微博爬虫任务 {task_id} 已被用户停止，用户：{name_str}")
+            except Exception as notify_err:
+                logger.warning("发送 PushDeer 停止通知失败: %s", notify_err)
+            return
 
         # 爬取完成后，同步 dict 形式 user_id_list 的 per-user since/end
         try:
@@ -240,25 +275,27 @@ def run_refresh_task(task_id, user_id_list=None):
         except Exception as cfg_err:
             logger.warning("更新 config.json 中 end_date 失败: %s", cfg_err)
 
-        tasks[task_id]['progress'] = 100
-        tasks[task_id]['state'] = 'SUCCESS'
-        tasks[task_id]['result'] = {"message": "微博列表已刷新"}
+        tasks[task_id]["progress"] = 100
+        tasks[task_id]["state"] = "SUCCESS"
+        tasks[task_id]["result"] = {"message": "微博列表已刷新"}
+        tasks[task_id]["command"] = "FINISHED"
 
         # 任务成功完成后发送 PushDeer 通知
         try:
-            if const.NOTIFY.get("NOTIFY"):
+            if config and const.NOTIFY.get("NOTIFY"):
                 name_str = _resolve_user_names_for_notification(config) or "未知用户"
                 push_deer(f"微博爬虫任务 {task_id} 已完成，用户：{name_str}")
         except Exception as notify_err:
             logger.warning("发送 PushDeer 成功通知失败: %s", notify_err)
-        
+
     except Exception as e:
-        tasks[task_id]['state'] = 'FAILED'
-        tasks[task_id]['error'] = str(e)
+        tasks[task_id]["state"] = "FAILED"
+        tasks[task_id]["error"] = str(e)
+        tasks[task_id]["command"] = "FINISHED"
         logger.exception(e)
         # 任务失败时也发送 PushDeer 通知
         try:
-            if const.NOTIFY.get("NOTIFY"):
+            if config and const.NOTIFY.get("NOTIFY"):
                 name_str = _resolve_user_names_for_notification(config) or "未知用户"
                 push_deer(f"微博爬虫任务 {task_id} 失败，用户：{name_str}，错误：{e}")
         except Exception as notify_err:
@@ -524,10 +561,12 @@ def refresh():
             logger.info("refresh POST: acquiring task_lock to start task")
             task_id = str(uuid.uuid4())
             tasks[task_id] = {
-                'state': 'PENDING',
-                'progress': 0,
-                'created_at': datetime.now().isoformat(),
-                'user_id_list': user_id_list,
+                "state": "PENDING",
+                "progress": 0,
+                "created_at": datetime.now().isoformat(),
+                "user_id_list": user_id_list,
+                # command 用于控制任务状态（例如 STOP）
+                "command": "RUNNING",
             }
             current_task_id = task_id
 
@@ -541,6 +580,71 @@ def refresh():
 
     # 走到这里说明既不是 GET，也不是表单 POST，直接返回 400
     return "Unsupported request type for /refresh", 400
+
+
+@app.route('/task/<task_id>/stop', methods=['POST'])
+def stop_task(task_id):
+    """
+    停止指定任务（方案1：仅支持“停止”，不支持继续/恢复）。
+    通过将 tasks[task_id]['command'] 置为 'STOP'，让后台线程在安全检查点优雅退出。
+    """
+    task = tasks.get(task_id)
+    if not task:
+        data = {"error": "Task not found"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>停止任务</title></head>
+              <body>
+                <h1>任务 {escape(task_id)} 未找到</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 404
+        return jsonify(data), 404
+
+    state = task.get("state")
+    if state not in ["PENDING", "PROGRESS"]:
+        # 任务已结束，不能再停止
+        msg = f"任务当前状态为 {state}，无法停止"
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>停止任务</title></head>
+              <body>
+                <h1>任务 {escape(task_id)} 无法停止</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>state</th><td>{escape(str(state))}</td></tr>
+                  <tr><th>message</th><td>{escape(msg)}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a> | <a href="/task/{escape(task_id)}">返回任务详情</a></p>
+              </body>
+            </html>
+            """
+            return html, 400
+        return jsonify({"error": msg, "state": state}), 400
+
+    # 标记为 STOP，后台线程会在合适的检查点抛出 TaskStopped 结束任务
+    with task_lock:
+        if task_id in tasks:
+            tasks[task_id]["command"] = "STOP"
+
+    if wants_html():
+        # 根据来源页面决定跳转位置：从任务列表来就回到列表，从状态页来就回到状态页，
+        # 并通过查询参数带上“已终止”的提示
+        ref = request.referrer or ""
+        if "/tasks" in ref:
+            return redirect(f"/tasks?stopped={task_id}")
+        if "/status" in ref:
+            return redirect(f"/status?stopped={task_id}")
+        # 其他情况默认跳转到任务详情页
+        return redirect(f"/task/{task_id}?stopped=1")
+    return jsonify({"message": "停止请求已发送", "task_id": task_id}), 200
+
 
 @app.route('/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):
@@ -581,15 +685,32 @@ def get_task_status(task_id):
             rows.append(
                 f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
             )
+        # 如果任务仍在运行，则提供“停止该任务”的按钮；
+        # 当 command 已为 STOP 时，按钮置灰不可用
+        stop_button_html = ""
+        if task.get('state') in ['PENDING', 'PROGRESS']:
+            stop_disabled = task.get('command') == 'STOP'
+            stop_button_html = f"""
+            <form method="post" action="/task/{escape(task_id)}/stop" style="display:inline;">
+              <button type="submit" {'disabled' if stop_disabled else ''}>停止该任务</button>
+            </form>
+            """
+        # 如果通过查询参数标记已停止，则给出提示
+        notice_html = ""
+        if request.args.get("stopped"):
+            notice_html = (
+                f"<p style='color:red;'>任务 {escape(task_id)} 已终止</p>"
+            )
         html = f"""
         <html>
           <head><meta charset="utf-8"><title>任务详情 {escape(task_id)}</title></head>
           <body>
             <h1>任务详情</h1>
+            {notice_html}
             <table border="1" cellspacing="0" cellpadding="4">
               {''.join(rows)}
             </table>
-            <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+            <p>{stop_button_html}<a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
           </body>
         </html>
         """
@@ -598,13 +719,22 @@ def get_task_status(task_id):
     return jsonify(response)
 
 
-@app.route('/tasks', methods=['GET'])
+@app.route('/tasks', methods=['GET', 'POST'])
 def list_tasks():
     """
     列出所有任务及其状态（按 created_at 倒序）。
     只做状态查看，不会触发新的任务。
     """
-    # 将 tasks 按 created_at 逆序排序
+    # 如果是 POST 并且带有删除参数，则删除指定任务后重定向
+    if request.method == 'POST':
+        task_id = request.form.get('task_id')
+        if task_id and task_id in tasks:
+            # 仅删除非运行中任务
+            if tasks[task_id].get('state') not in ['PENDING', 'PROGRESS']:
+                tasks.pop(task_id, None)
+        return redirect('/tasks')
+
+    # GET：将 tasks 按 created_at 逆序排序
     items = []
     for tid, t in tasks.items():
         items.append({
@@ -613,23 +743,47 @@ def list_tasks():
             'progress': t.get('progress'),
             'created_at': t.get('created_at'),
             'user_id_list': t.get('user_id_list'),
+            'command': t.get('command'),
         })
     items.sort(key=lambda x: x.get('created_at') or "", reverse=True)
     if wants_html():
+        # 如果通过 stopped 参数传入任务ID，则在页面上给出“任务已终止”的提示
+        notice_html = ""
+        stopped_id = request.args.get("stopped")
+        if stopped_id:
+            notice_html = (
+                f"<p style='color:red;'>任务 {escape(str(stopped_id))} 已终止</p>"
+            )
         header_cells = "".join(
             f"<th>{escape(col)}</th>"
-            for col in ["task_id", "state", "progress", "created_at", "user_id_list"]
+            for col in ["task_id", "state", "progress", "created_at", "user_id_list", "操作"]
         )
         body_rows = []
         for it in items:
+            state = str(it.get('state'))
+            command = str(it.get('command') or "")
+            delete_disabled = state in ['PENDING', 'PROGRESS']
+            delete_button = (
+                f"<button type=\"submit\" name=\"task_id\" value=\"{escape(it['task_id'])}\" "
+                f"{'disabled' if delete_disabled else ''}>删除</button>"
+            )
+            # 运行中的任务提供“停止”按钮，指向 /task/<task_id>/stop；
+            # 如果已发出停止命令，则按钮置灰不可用
+            stop_disabled = not (state in ['PENDING', 'PROGRESS'] and command != 'STOP')
+            stop_button = (
+                f"<button type=\"submit\" "
+                f"formaction=\"/task/{escape(it['task_id'])}/stop\" "
+                f"formmethod=\"post\" "
+                f"{'disabled' if stop_disabled else ''}>停止</button>"
+            )
             body_rows.append(
                 "<tr>"
-                # task_id 列作为链接，点击跳到 /task/<task_id>
                 f"<td><a href=\"/task/{escape(it['task_id'])}\">{escape(it['task_id'])}</a></td>"
-                f"<td>{escape(str(it.get('state')))}</td>"
+                f"<td>{escape(state)}</td>"
                 f"<td>{escape(str(it.get('progress')))}</td>"
                 f"<td>{escape(str(it.get('created_at')))}</td>"
                 f"<td>{escape(str(it.get('user_id_list')))}</td>"
+                f"<td>{stop_button} {delete_button}</td>"
                 "</tr>"
             )
         html = f"""
@@ -637,12 +791,15 @@ def list_tasks():
           <head><meta charset="utf-8"><title>任务列表</title></head>
           <body>
             <h1>任务列表</h1>
-            <table border="1" cellspacing="0" cellpadding="4">
-              <thead><tr>{header_cells}</tr></thead>
-              <tbody>
-                {''.join(body_rows)}
-              </tbody>
-            </table>
+            {notice_html}
+            <form method="post" action="/tasks">
+              <table border="1" cellspacing="0" cellpadding="4">
+                <thead><tr>{header_cells}</tr></thead>
+                <tbody>
+                  {''.join(body_rows)}
+                </tbody>
+              </table>
+            </form>
             <p><a href="/">返回首页</a></p>
           </body>
         </html>
@@ -680,15 +837,31 @@ def get_current_status():
                 f"<tr><th>created_at</th><td>{escape(str(data['created_at']))}</td></tr>",
                 f"<tr><th>user_id_list</th><td>{escape(str(data['user_id_list']))}</td></tr>",
             ]
+            # 对当前运行任务提供“停止该任务”按钮；当 command 已为 STOP 时置灰不可用
+            stop_button_html = ""
+            if data.get('state') in ['PENDING', 'PROGRESS']:
+                stop_disabled = running_task.get('command') == 'STOP'
+                stop_button_html = f"""
+                <form method="post" action="/task/{escape(str(data['task_id']))}/stop" style="display:inline;">
+                  <button type="submit" {'disabled' if stop_disabled else ''}>停止该任务</button>
+                </form>
+                """
+            notice_html = ""
+            stopped_id = request.args.get("stopped")
+            if stopped_id:
+                notice_html = (
+                    f"<p style='color:red;'>任务 {escape(str(stopped_id))} 已终止</p>"
+                )
             html = f"""
             <html>
               <head><meta charset="utf-8"><title>当前状态</title></head>
               <body>
                 <h1>当前运行任务</h1>
+                {notice_html}
                 <table border="1" cellspacing="0" cellpadding="4">
                   {''.join(rows)}
                 </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+                <p>{stop_button_html}<a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
               </body>
             </html>
             """
