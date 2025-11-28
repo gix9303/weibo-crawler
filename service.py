@@ -3,7 +3,7 @@ import const
 import logging
 import logging.config
 import os
-from flask import Flask, jsonify, request, redirect, send_file
+from flask import Flask, jsonify, request, redirect, send_file, send_from_directory
 import sqlite3
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +18,6 @@ import re
 # 1896820725 天津股侠 2024-12-09T16:47:04
 
 DATABASE_PATH = './weibo/weibodata.db'
-print(DATABASE_PATH)
 
 # 如果日志文件夹不存在，则创建
 if not os.path.isdir("log/"):
@@ -123,6 +122,10 @@ executor = ThreadPoolExecutor(max_workers=1)  # 限制只有1个worker避免并�
 current_task_id = None  # 当前正在后台执行的任务 ID
 task_lock = threading.Lock()  # 防止同时创建/修改 current_task_id
 
+# 定时调度相关
+scheduler_stop_event = threading.Event()
+scheduler_thread = None
+
 
 def _init_tasks_table():
     """初始化 tasks 表，用于持久化任务列表。"""
@@ -148,11 +151,18 @@ def _init_tasks_table():
                 user_id_list TEXT,
                 command      TEXT,
                 error        TEXT,
-                result       TEXT
+                result       TEXT,
+                schedule_id  TEXT
             )
             """
         )
         conn.commit()
+        # 尝试为已有表增加 schedule_id 列（若已存在会抛异常，忽略即可）
+        try:
+            cur.execute("ALTER TABLE tasks ADD COLUMN schedule_id TEXT")
+            conn.commit()
+        except Exception:
+            pass
     except Exception as e:
         logger.warning("初始化任务表失败: %s", e)
     finally:
@@ -180,6 +190,7 @@ def _row_to_task(row):
         command,
         error,
         result,
+        schedule_id,
     ) = row
     user_id_list = None
     if user_id_json:
@@ -196,10 +207,11 @@ def _row_to_task(row):
         "command": command,
         "error": error,
         "result": result,
+        "schedule_id": schedule_id,
     }
 
 
-def db_create_task(task_id: str, user_id_list):
+def db_create_task(task_id: str, user_id_list, schedule_id: str | None = None):
     """在数据库中创建一条新任务记录，初始为 PENDING。"""
     user_id_json = None
     if user_id_list is not None:
@@ -213,8 +225,8 @@ def db_create_task(task_id: str, user_id_list):
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO tasks (task_id, state, progress, created_at, user_id_list, command)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (task_id, state, progress, created_at, user_id_list, command, schedule_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -223,6 +235,7 @@ def db_create_task(task_id: str, user_id_list):
                 datetime.now().isoformat(),
                 user_id_json,
                 "RUNNING",
+                schedule_id,
             ),
         )
         conn.commit()
@@ -237,7 +250,7 @@ def db_update_task(task_id: str, **fields):
     """更新任务记录中的指定字段。"""
     if not fields:
         return
-    allowed = {"state", "progress", "created_at", "user_id_list", "command", "error", "result"}
+    allowed = {"state", "progress", "created_at", "user_id_list", "command", "error", "result", "schedule_id"}
     sets = []
     params = []
     for k, v in fields.items():
@@ -280,7 +293,7 @@ def db_get_task(task_id: str):
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result, schedule_id
             FROM tasks WHERE task_id = ?
             """,
             (task_id,),
@@ -312,7 +325,7 @@ def get_running_task():
         if cid:
             cur.execute(
                 """
-                SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+                SELECT task_id, state, progress, created_at, user_id_list, command, error, result, schedule_id
                 FROM tasks
                 WHERE task_id = ? AND state IN ('PENDING', 'PROGRESS')
                 """,
@@ -326,7 +339,7 @@ def get_running_task():
         # 回退：从所有任务中找出正在运行的任务（按创建时间倒序，取最新）
         cur.execute(
             """
-            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result, schedule_id
             FROM tasks
             WHERE state IN ('PENDING', 'PROGRESS')
             ORDER BY created_at DESC
@@ -412,12 +425,199 @@ def _resolve_user_names_for_notification(config: dict) -> str:
 
     return ",".join(names) if names else ",".join(user_ids)
 
+
+def _schedule_loop():
+    """
+    简单定时调度器：
+    - 每隔 60 秒检查一次 config.json 中的 schedule.enable
+    - 若开启定时任务且当前没有运行中的任务，则根据 interval_minutes 判断是否需要新建任务
+    - 新任务使用最新的 config.json 中 user_id_list 和其它配置
+    """
+    global current_task_id
+    logger.info("定时调度器启动")
+    while not scheduler_stop_event.is_set():
+        try:
+            time.sleep(60)  # 检查间隔 60 秒
+
+            # 读取配置，判断是否开启定时任务
+            try:
+                cfg = load_config_from_file()
+            except SystemExit:
+                cfg = {}
+            except Exception:
+                cfg = {}
+
+            schedule_cfg = cfg.get("schedule") or {}
+            if not isinstance(schedule_cfg, dict):
+                continue
+            if not schedule_cfg.get("enable"):
+                continue
+            # 定时任务所属的父任务 ID（schedule_id），由首次“保存并启动”时写入 config.json
+            schedule_id = schedule_cfg.get("schedule_id")
+            if not schedule_id:
+                continue
+
+            # 间隔分钟数，默认 60 分钟
+            try:
+                interval_minutes = int(schedule_cfg.get("interval_minutes", 60))
+            except Exception:
+                interval_minutes = 60
+            if interval_minutes <= 0:
+                interval_minutes = 60
+            interval_seconds = interval_minutes * 60
+
+            # 若有任务在运行，则不启动新的任务
+            running_task_id, running_task = get_running_task()
+            if running_task:
+                continue
+
+            # 读取该定时任务（schedule_id）最近一次任务的创建时间
+            last_created_at = None
+            conn = None
+            try:
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT created_at FROM tasks
+                    WHERE schedule_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                    ,
+                    (schedule_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    last_created_at = row[0]
+            except Exception as e:
+                logger.warning("定时调度器查询最近任务失败: %s", e)
+            finally:
+                if conn:
+                    conn.close()
+
+            now = datetime.now()
+            if last_created_at:
+                try:
+                    last_dt = datetime.fromisoformat(last_created_at)
+                    if (now - last_dt).total_seconds() < interval_seconds:
+                        # 间隔未到，跳过本轮
+                        continue
+                except Exception:
+                    # 解析失败时不阻断调度
+                    pass
+
+            # 到达调度时间，且没有运行中的任务 -> 创建新任务
+            user_id_list = cfg.get("user_id_list")
+            if not isinstance(user_id_list, list) or not user_id_list:
+                continue
+
+            with task_lock:
+                task_id = str(uuid.uuid4())
+                # 定时任务的 schedule_id 统一与父任务 ID 一致
+                db_create_task(task_id, user_id_list, schedule_id=str(schedule_id))
+                current_task_id = task_id
+
+            logger.info("定时调度器自动启动任务: %s", task_id)
+            executor.submit(run_refresh_task, task_id, None)
+
+        except Exception as e:
+            logger.warning("定时调度器异常: %s", e)
+            continue
+
+
+def _start_scheduler_if_needed():
+    """
+    仅在用户通过“保存配置并启动任务”启用了定时任务后，才启动调度线程。
+    避免仅运行 python service.py 就立刻自动执行定时任务。
+    """
+    global scheduler_thread
+    if scheduler_thread is not None:
+        return
+    try:
+        scheduler_thread = threading.Thread(target=_schedule_loop, daemon=True)
+        scheduler_thread.start()
+        logger.info("定时调度器线程已启动")
+    except Exception as e:
+        logger.warning("启动定时调度器失败: %s", e)
+
+
+def _auto_start_scheduler_on_boot():
+    """
+    在服务启动时，根据 config.json 自动恢复之前配置好的定时任务：
+    - 仅当 schedule.enable 为 True 且存在有效的 schedule_id 时才启动调度器；
+    - 保证只有在用户曾经通过“保存配置并启动任务”创建过定时任务后，重启 service.py 才会恢复。
+    """
+    try:
+        cfg = load_config_from_file()
+    except SystemExit:
+        # 主配置不存在或格式错误时，直接跳过
+        return
+    except Exception as e:
+        logger.warning("启动时读取 config.json 失败，跳过自动恢复定时任务: %s", e)
+        return
+
+    schedule_cfg = cfg.get("schedule") or {}
+    if not isinstance(schedule_cfg, dict):
+        return
+    if not schedule_cfg.get("enable"):
+        return
+    if not schedule_cfg.get("schedule_id"):
+        return
+
+    logger.info("检测到已启用的定时任务配置，尝试恢复定时调度")
+    _start_scheduler_if_needed()
+
 def run_refresh_task(task_id, user_id_list=None):
     global current_task_id
     config = None  # 确保异常路径中也能安全引用
     try:
         # 任务开始时更新数据库状态为 PROGRESS
         db_update_task(task_id, state="PROGRESS", progress=0, command="RUNNING")
+
+        # 若当前任务属于某个定时任务（schedule_id 存在且与 task_id 不同），
+        # 则视为“子任务”。在子任务开始前，将上一次运行保存在 config.json
+        # 中的 end_date 迁移到 since_date，并清空 end_date，
+        # 以便本次子任务从上一次的结束时间继续抓取。
+        try:
+            task_info = db_get_task(task_id)
+        except Exception as task_query_err:
+            task_info = None
+            logger.warning("查询任务 %s 的 schedule_id 失败: %s", task_id, task_query_err)
+
+        try:
+            if task_info:
+                schedule_id_val = task_info.get("schedule_id")
+                # 父任务：schedule_id == task_id
+                # 子任务：schedule_id 存在且 != task_id
+                if schedule_id_val and str(schedule_id_val) != str(task_id):
+                    config_path = os.path.join(os.path.split(os.path.realpath(__file__))[0], "config.json")
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg_for_child = json.load(f)
+
+                    schedule_cfg = cfg_for_child.get("schedule") or {}
+                    if not isinstance(schedule_cfg, dict):
+                        schedule_cfg = {}
+                    schedule_enabled = bool(schedule_cfg.get("enable"))
+
+                    # 只有在 config.json 中仍然启用了定时任务时，才进行 since/end 的迁移
+                    if schedule_enabled:
+                        ul = cfg_for_child.get("user_id_list")
+                        if isinstance(ul, list):
+                            for entry in ul:
+                                if not isinstance(entry, dict):
+                                    continue
+                                prev_end = entry.get("end_date")
+                                if prev_end:
+                                    # 将上一次的 end_date 作为本次子任务的 since_date，并清空 end_date
+                                    entry["since_date"] = prev_end
+                                    entry["end_date"] = ""
+
+                        with open(config_path, "w", encoding="utf-8") as f:
+                            json.dump(cfg_for_child, f, ensure_ascii=False, indent=4)
+                        logger.info("任务 %s 为定时子任务，已将上次 end_date 迁移到 since_date 并清空 end_date", task_id)
+        except Exception as shift_err:
+            logger.warning("任务 %s 在子任务启动前处理 since/end 失败: %s", task_id, shift_err)
 
         config = get_config(user_id_list)
         # 将当前任务 ID 传给 Weibo，用于隔离输出目录 weibo/<task_id>/
@@ -478,6 +678,8 @@ def run_refresh_task(task_id, user_id_list=None):
             config_path = os.path.join(os.path.split(os.path.realpath(__file__))[0], "config.json")
             with open(config_path, "r", encoding="utf-8") as f:
                 latest_cfg = json.load(f)
+            schedule_cfg = (latest_cfg.get("schedule") or {}) if isinstance(latest_cfg, dict) else {}
+            schedule_enabled = bool(schedule_cfg.get("enable"))
             # 如果 config.json 中 user_id_list 是 list[dict]，则将 Weibo 内部更新后的
             # 每个用户的 since_date / end_date 写回 config.json
             try:
@@ -497,10 +699,12 @@ def run_refresh_task(task_id, user_id_list=None):
                         u_cfg = per_user.get(uid)
                         if not u_cfg:
                             continue
-                        if u_cfg.get("since_date"):
-                            entry["since_date"] = u_cfg["since_date"]
-                        if u_cfg.get("end_date"):
-                            entry["end_date"] = u_cfg["end_date"]
+                        since_val = u_cfg.get("since_date")
+                        end_val = u_cfg.get("end_date")
+                        if end_val:
+                            entry["end_date"] = end_val
+                        if since_val:
+                            entry["since_date"] = since_val
             except Exception as per_err:
                 logger.warning("同步 config.json 中 user_id_list per-user 时间失败: %s", per_err)
 
@@ -521,7 +725,13 @@ def run_refresh_task(task_id, user_id_list=None):
         try:
             if config and const.NOTIFY.get("NOTIFY"):
                 name_str = _resolve_user_names_for_notification(config) or "未知用户"
-                push_deer(f"微博爬虫任务 {task_id} 已完成，用户：{name_str}")
+                # 如果有实际抓取到微博数据才发送成功通知
+                try:
+                    got_count = getattr(wb, "got_count", 0)
+                except Exception:
+                    got_count = 0
+                if got_count and got_count > 0:
+                    push_deer(f"微博爬虫任务 {task_id} 已完成，用户：{name_str}")
         except Exception as notify_err:
             logger.warning("发送 PushDeer 成功通知失败: %s", notify_err)
 
@@ -611,8 +821,11 @@ def refresh():
         notify_cfg = cfg.get("notify") or {}
         notify_enable_val = bool(notify_cfg.get("enable", False))
         notify_push_key_val = notify_cfg.get("push_key", "")
+        schedule_cfg = cfg.get("schedule") or {}
+        schedule_enable_val = bool(schedule_cfg.get("enable", False))
 
         checked_attr = "checked" if notify_enable_val else ""
+        schedule_checked_attr = "checked" if schedule_enable_val else ""
 
         html = f"""
         <html>
@@ -681,7 +894,7 @@ def refresh():
                   <td>
                     <label style="margin-right: 8px;">
                       <input type="checkbox" id="notify_enable" name="notify_enable" value="1" {checked_attr}
-                             onchange="togglePushKey()" />
+                            onchange="togglePushKey()" />
                       启用通知
                     </label>
                     <span id="notify_push_key_container" style="display:none;">
@@ -689,6 +902,15 @@ def refresh():
                       <input type="text" name="notify_push_key" style="width:260px;"
                              value="{escape(str(notify_push_key_val))}" />
                     </span>
+                  </td>
+                </tr>
+                <tr>
+                  <th>定时任务</th>
+                  <td>
+                    <label>
+                      <input type="checkbox" id="schedule_enable" name="schedule_enable" value="1" {schedule_checked_attr} />
+                      启用定时任务（每隔 1 小时自动启动一次任务）
+                    </label>
                   </td>
                 </tr>
               </table>
@@ -751,6 +973,7 @@ def refresh():
         cookie_val = form.get("cookie", "").strip()
         notify_enable_val = form.get("notify_enable") is not None
         notify_push_key_val = form.get("notify_push_key", "").strip()
+        schedule_enable_val = form.get("schedule_enable") is not None
 
         cfg["cookie"] = cookie_val
 
@@ -763,7 +986,17 @@ def refresh():
             notify_cfg["push_key"] = notify_push_key_val
         cfg["notify"] = notify_cfg
 
-        # 写回 config.json
+        schedule_cfg = cfg.get("schedule") or {}
+        if not isinstance(schedule_cfg, dict):
+            schedule_cfg = {}
+        schedule_cfg["enable"] = bool(schedule_enable_val)
+        # 间隔固定为 60 分钟，如需可配置后续再扩展
+        if "interval_minutes" not in schedule_cfg:
+            schedule_cfg["interval_minutes"] = 60
+        # schedule_id 在“保存并启动”时确定，这里先保留原值
+        cfg["schedule"] = schedule_cfg
+
+        # 写回 config.json（此时 schedule_id 可能还未更新，稍后在创建任务后再补写一次）
         try:
             logger.info("refresh POST: writing config.json")
             with open(config_path, "w", encoding="utf-8") as f:
@@ -800,8 +1033,37 @@ def refresh():
         with task_lock:
             logger.info("refresh POST: acquiring task_lock to start task")
             task_id = str(uuid.uuid4())
-            db_create_task(task_id, user_id_list)
+            # 若启用了定时任务，则将当前任务视为父任务：schedule_id = 本次 task_id
+            schedule_cfg = cfg.get("schedule") or {}
+            schedule_enable_val = bool(schedule_cfg.get("enable")) if isinstance(schedule_cfg, dict) else False
+            schedule_id = task_id if schedule_enable_val else None
+            db_create_task(task_id, user_id_list, schedule_id=schedule_id)
             current_task_id = task_id
+
+            # 如果启用定时任务，则将父任务的 task_id 写入 config.json 的 schedule.schedule_id
+            if schedule_enable_val:
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        latest_cfg = json.load(f)
+                except Exception:
+                    latest_cfg = {}
+                schedule_cfg2 = latest_cfg.get("schedule") or {}
+                if not isinstance(schedule_cfg2, dict):
+                    schedule_cfg2 = {}
+                schedule_cfg2["enable"] = True
+                schedule_cfg2["interval_minutes"] = schedule_cfg2.get("interval_minutes", 60)
+                schedule_cfg2["schedule_id"] = task_id
+                latest_cfg["schedule"] = schedule_cfg2
+                try:
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(latest_cfg, f, ensure_ascii=False, indent=4)
+                    logger.info("已将定时任务父任务 schedule_id 写入 config.json: %s", task_id)
+                except Exception as e:
+                    logger.warning("写入 schedule_id 到 config.json 失败: %s", e)
+
+        # 只有在“保存配置并启动任务”并且启用了定时任务时，才允许启动定时调度器
+        if schedule_enable_val:
+            _start_scheduler_if_needed()
 
         # 提交任务，传入 None，让 run_refresh_task 自行通过 get_config 读取最新配置
         logger.info("refresh POST: submitting background task")
@@ -1044,6 +1306,298 @@ def download_task_weibo(task_id):
         mimetype="application/zip",
     )
 
+
+@app.route('/schedule/download', methods=['GET'])
+def download_schedule_results():
+    """
+    下载某个定时任务（schedule）的聚合结果。
+    - 基于 SQLite 中的完整数据，为每个用户导出“所有微博”和“所有评论”的 CSV，以及一份聚合 PDF
+    - 默认选择最近一个有 schedule_id 的父任务；也可通过 ?schedule_id=<task_id> 指定
+    """
+    base_dir = os.path.split(os.path.realpath(__file__))[0]
+    schedule_id = request.args.get("schedule_id")
+
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+
+        # 如果未指定 schedule_id，则选择最近一个存在的 schedule_id
+        if not schedule_id:
+            cur.execute(
+                """
+                SELECT schedule_id
+                FROM tasks
+                WHERE schedule_id IS NOT NULL AND schedule_id != ''
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                schedule_id = str(row[0])
+
+        if not schedule_id:
+            raise ValueError("未找到任何带有 schedule_id 的任务")
+
+        # 聚合该 schedule 下的所有任务的 user_id_list，形成用户 ID 集合
+        cur.execute(
+            """
+            SELECT user_id_list
+            FROM tasks
+            WHERE schedule_id = ?
+            """,
+            (schedule_id,),
+        )
+        rows = cur.fetchall()
+        user_ids: set[str] = set()
+        for r in rows:
+            raw = r[0]
+            if not raw:
+                continue
+            try:
+                ul = json.loads(raw)
+            except Exception:
+                ul = raw
+            if isinstance(ul, list):
+                for item in ul:
+                    if isinstance(item, dict):
+                        uid = item.get("user_id") or item.get("id")
+                    else:
+                        uid = item
+                    if uid:
+                        user_ids.add(str(uid).strip())
+            else:
+                s = str(ul).strip()
+                if s:
+                    user_ids.add(s)
+    except Exception as e:
+        logger.warning("查询 schedule 任务列表失败: %s", e)
+        if conn:
+            conn.close()
+        data = {"error": f"查询定时任务失败: {e}"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
+              <body>
+                <h1>下载失败</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 500
+        return jsonify(data), 500
+    finally:
+        if conn:
+            conn = None  # 真正的关闭操作在后面新的 conn 使用中处理
+
+    if not user_ids:
+        data = {"error": f"定时任务 {schedule_id} 下未找到任何用户信息"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
+              <body>
+                <h1>下载失败</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 404
+        return jsonify(data), 404
+
+    import tempfile
+    import shutil
+    from pathlib import Path
+    from util.pdf_exporter import WeiboPdfExporter
+
+    # 临时目录，用于聚合导出
+    tmp_root = tempfile.mkdtemp(prefix=f"schedule_{schedule_id}_")
+    agg_root = os.path.join(tmp_root, "aggregated")
+    os.makedirs(agg_root, exist_ok=True)
+
+    # 打开 SQLite 连接，后续查询用
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+    except Exception as e:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        data = {"error": f"打开 SQLite 数据库失败: {e}"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
+              <body>
+                <h1>下载失败</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 500
+        return jsonify(data), 500
+
+    # 为每个用户导出聚合微博 / 评论 CSV 和 PDF
+    exported_any = False
+    try:
+        for uid in sorted(user_ids):
+            if not uid:
+                continue
+
+            # 查询昵称
+            nick = uid
+            try:
+                cur.execute("SELECT nick_name FROM user WHERE id = ?", (uid,))
+                row = cur.fetchone()
+                if row and row["nick_name"]:
+                    nick = row["nick_name"]
+            except Exception:
+                pass
+            safe_nick = re.sub(r'[\\/:*?"<>|]', "_", str(nick))
+
+            user_dir = os.path.join(agg_root, safe_nick)
+            os.makedirs(user_dir, exist_ok=True)
+
+            # 导出所有微博
+            try:
+                cur.execute(
+                    """
+                    SELECT id, bid, user_id, screen_name, text, article_url,
+                           topics, at_users, pics, video_url, live_photo_url,
+                           location, created_at, source,
+                           attitudes_count, comments_count, reposts_count, retweet_id
+                    FROM weibo
+                    WHERE user_id = ?
+                    ORDER BY datetime(created_at) ASC, id ASC
+                    """,
+                    (uid,),
+                )
+                weibo_rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("导出用户 %s 微博失败: %s", uid, e)
+                weibo_rows = []
+
+            if weibo_rows:
+                weibo_csv_path = os.path.join(user_dir, f"{safe_nick}_weibos_all.csv")
+                headers = list(weibo_rows[0].keys())
+                import csv
+
+                with open(weibo_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    for r in weibo_rows:
+                        writer.writerow([r[h] for h in headers])
+
+            # 导出评论
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.id,
+                        c.weibo_id,
+                        c.created_at,
+                        c.user_screen_name,
+                        c.text,
+                        c.pic_url,
+                        c.like_count
+                    FROM comments c
+                    JOIN weibo w ON c.weibo_id = w.id
+                    WHERE w.user_id = ?
+                    ORDER BY datetime(c.created_at) ASC, c.id ASC
+                    """,
+                    (uid,),
+                )
+                comment_rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("导出用户 %s 评论失败: %s", uid, e)
+                comment_rows = []
+
+            if comment_rows:
+                comments_csv_path = os.path.join(user_dir, f"{safe_nick}_comments_all.csv")
+                headers = list(comment_rows[0].keys())
+                import csv
+
+                with open(comments_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    for r in comment_rows:
+                        writer.writerow([r[h] for h in headers])
+
+            # 导出 PDF（聚合所有微博+评论）
+            try:
+                db_path = Path(DATABASE_PATH)
+                pdf_exporter = WeiboPdfExporter(db_path=db_path)
+                pdf_path = pdf_exporter.export_user_timeline(
+                    user_id=str(uid),
+                    output_path=os.path.join(user_dir, f"{safe_nick}_all.pdf"),
+                )
+                logger.info("为用户 %s 导出聚合 PDF: %s", uid, pdf_path)
+            except Exception as e:
+                logger.warning("为用户 %s 导出聚合 PDF 失败: %s", uid, e)
+
+            exported_any = exported_any or bool(weibo_rows or comment_rows)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not exported_any:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        data = {"error": f"定时任务 {schedule_id} 下没有可导出的微博或评论数据"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
+              <body>
+                <h1>下载失败</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 404
+        return jsonify(data), 404
+
+    zip_base = os.path.join(tmp_root, f"schedule_{schedule_id}_aggregated")
+    try:
+        zip_path = shutil.make_archive(zip_base, "zip", agg_root)
+    except Exception as e:
+        logger.exception("打包定时任务结果失败: %s", e)
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        data = {"error": f"打包定时任务结果失败: {e}"}
+        if wants_html():
+            html = f"""
+            <html>
+              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
+              <body>
+                <h1>下载失败</h1>
+                <table border="1" cellspacing="0" cellpadding="4">
+                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
+                </table>
+                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
+              </body>
+            </html>
+            """
+            return html, 500
+        return jsonify(data), 500
+
+    # 不立即删除 zip 文件，让 send_file 可以访问；临时目录稍后由系统回收
+    download_name = f"schedule_results_{schedule_id}.zip"
+    return send_file(zip_path, as_attachment=True, download_name=download_name, mimetype="application/zip")
+
 @app.route('/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):
     task = db_get_task(task_id)
@@ -1052,7 +1606,11 @@ def get_task_status(task_id):
         if wants_html():
             html = f"""
             <html>
-              <head><meta charset="utf-8"><title>任务详情</title></head>
+              <head>
+                <meta charset="utf-8">
+                <title>任务详情</title>
+                <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
+              </head>
               <body>
                 <h1>任务 {escape(task_id)} 未找到</h1>
                 <table border="1" cellspacing="0" cellpadding="4">
@@ -1123,12 +1681,97 @@ def get_task_status(task_id):
                 conn.close()  # type: ignore[name-defined]
             except Exception:
                 pass
-        # 如果任务成功完成，提供下载 weibo 目录内容的链接
+        # 父子关系信息
+        schedule_id = task.get("schedule_id")
+        parent_info_html = ""
+        has_running_child = False
+        # 如果是子任务（有父任务且 schedule_id != 本任务ID），在顶部显示子任务图标和“跳转父任务”按钮
+        parent_task_id = None
+        if schedule_id and str(schedule_id) != task_id:
+            parent_task_id = str(schedule_id)
+            parent_info_html = f"""
+            <p>
+              <span class="iconfont icon-zi" style="margin-right:4px;"></span>
+              本任务属于定时父任务
+              <a href="/task/{escape(parent_task_id)}">{escape(parent_task_id)}</a>
+              <form method="get" action="/task/{escape(parent_task_id)}" style="display:inline;margin-left:8px;">
+                <button type="submit">跳转父任务</button>
+              </form>
+            </p>
+            """
+
+        # 如果是父任务（schedule_id == 本任务ID），按时间轴展示所有子任务链接
+        timeline_html = ""
+        if schedule_id and str(schedule_id) == task_id:
+            try:
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT task_id, state, progress, created_at
+                    FROM tasks
+                    WHERE schedule_id = ? AND task_id != ?
+                    ORDER BY created_at ASC
+                    """,
+                    (task_id, task_id),
+                )
+                child_rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("查询父任务 %s 的子任务失败: %s", task_id, e)
+                child_rows = []
+            finally:
+                try:
+                    conn.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+
+            if child_rows:
+                items = []
+                for cid, cstate, cprog, ccreated in child_rows:
+                    if str(cstate) in ["PENDING", "PROGRESS"]:
+                        has_running_child = True
+                    items.append(
+                        "<li>"
+                        f"{escape(str(ccreated))} - 子任务 "
+                        f"<a href=\"/task/{escape(str(cid))}\">{escape(str(cid))}</a> "
+                        f"(state={escape(str(cstate))}, progress={escape(str(cprog))})"
+                        "</li>"
+                    )
+                timeline_html = (
+                    "<h2>子任务时间轴</h2>"
+                    "<ul>"
+                    + "".join(items)
+                    + "</ul>"
+                )
+        # 下载当前任务 weibo 目录内容：
+        # - SUCCESS：正常可点
+        # - PENDING/PROGRESS：灰色提示，按钮不可点
         download_link_html = ""
-        if task.get('state') == 'SUCCESS':
+        state = task.get('state')
+        if state == 'SUCCESS':
             download_link_html = (
                 f"<p><a href=\"/task/{escape(task_id)}/download\">下载当前 weibo 目录内容</a></p>"
             )
+        elif state in ['PENDING', 'PROGRESS']:
+            download_link_html = (
+                "<p><span style=\"color: gray;\">下载当前 weibo 目录内容（任务未完成，暂不可下载）</span></p>"
+            )
+
+        # 若该任务本身是定时任务的父任务（schedule_id == task_id），提供聚合下载链接；
+        # 如果存在运行中的子任务，则灰色不可点击
+        schedule_link_html = ""
+        if task.get("schedule_id") and str(task.get("schedule_id")) == task_id:
+            if has_running_child:
+                schedule_link_html = (
+                    "<p><span style=\"color: gray;\">"
+                    "下载该定时任务的聚合结果（存在运行中的子任务，暂不可下载）"
+                    "</span></p>"
+                )
+            else:
+                schedule_link_html = (
+                    f"<p><a href=\"/schedule/download?schedule_id={escape(task_id)}\">"
+                    f"下载该定时任务的聚合结果</a></p>"
+                )
         # 如果任务仍在运行，则提供“停止该任务”的按钮；
         # 当 command 已为 STOP 时，按钮置灰不可用
         stop_button_html = ""
@@ -1157,16 +1800,32 @@ def get_task_status(task_id):
             )
         nav_html = " | ".join(nav_links) if nav_links else ""
         nav_block = f"<p>{nav_html}</p>" if nav_html else ""
+
+        # 根据是否为定时任务父/子任务或普通任务，设置页面标题
+        if schedule_id and str(schedule_id) == task_id:
+            task_title = "任务详情(定时任务 -> 父任务)"
+        elif schedule_id and str(schedule_id) != task_id:
+            task_title = "任务详情(定时任务 -> 子任务)"
+        else:
+            task_title = "任务详情(普通任务)"
+
         html = f"""
         <html>
-          <head><meta charset="utf-8"><title>任务详情 {escape(task_id)}</title></head>
+          <head>
+            <meta charset="utf-8">
+            <title>{escape(task_title)}</title>
+            <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
+          </head>
             <body>
-            <h1>任务详情</h1>
+            <h1>{escape(task_title)}</h1>
             {notice_html}
+            {parent_info_html}
             <table border="1" cellspacing="0" cellpadding="4">
               {''.join(rows)}
             </table>
             {download_link_html}
+            {schedule_link_html}
+            {timeline_html}
             {nav_block}
             <p>{stop_button_html}<a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
           </body>
@@ -1212,7 +1871,7 @@ def list_tasks():
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result, schedule_id
             FROM tasks
             ORDER BY created_at DESC
             """
@@ -1241,11 +1900,13 @@ def list_tasks():
         )
         body_rows = []
         for it in items:
+            tid = str(it.get('task_id'))
             state = str(it.get('state'))
             command = str(it.get('command') or "")
+            schedule_id = it.get('schedule_id')
             delete_disabled = state in ['PENDING', 'PROGRESS']
             delete_button = (
-                f"<button type=\"submit\" name=\"task_id\" value=\"{escape(it['task_id'])}\" "
+                f"<button type=\"submit\" name=\"task_id\" value=\"{escape(tid)}\" "
                 f"{'disabled' if delete_disabled else ''}>删除</button>"
             )
             # 运行中的任务提供“停止”按钮，指向 /task/<task_id>/stop；
@@ -1253,13 +1914,23 @@ def list_tasks():
             stop_disabled = not (state in ['PENDING', 'PROGRESS'] and command != 'STOP')
             stop_button = (
                 f"<button type=\"submit\" "
-                f"formaction=\"/task/{escape(it['task_id'])}/stop\" "
+                f"formaction=\"/task/{escape(tid)}/stop\" "
                 f"formmethod=\"post\" "
                 f"{'disabled' if stop_disabled else ''}>停止</button>"
             )
+            # 根据 schedule_id 判断是否为定时父任务/子任务，在任务 ID 前显示图标
+            icon_html = ""
+            if schedule_id:
+                if str(schedule_id) == tid:
+                    # 父任务图标
+                    icon_html = '<span class="iconfont icon-fu" style="margin-right:4px;"></span>'
+                else:
+                    # 子任务图标
+                    icon_html = '<span class="iconfont icon-zi" style="margin-right:4px;"></span>'
+
             body_rows.append(
                 "<tr>"
-                f"<td><a href=\"/task/{escape(it['task_id'])}\">{escape(it['task_id'])}</a></td>"
+                f"<td>{icon_html}<a href=\"/task/{escape(tid)}\">{escape(tid)}</a></td>"
                 f"<td>{escape(state)}</td>"
                 f"<td>{escape(str(it.get('progress')))}</td>"
                 f"<td>{escape(str(it.get('created_at')))}</td>"
@@ -1268,9 +1939,13 @@ def list_tasks():
                 "</tr>"
             )
         html = f"""
-        <html>
-          <head><meta charset="utf-8"><title>任务列表</title></head>
-          <body>
+            <html>
+              <head>
+                <meta charset="utf-8">
+                <title>任务列表</title>
+                <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
+              </head>
+              <body>
             <h1>任务列表</h1>
             {notice_html}
             <form method="post" action="/tasks">
@@ -1306,9 +1981,16 @@ def get_current_status():
             'user_id_list': running_task.get('user_id_list'),
         }
         if wants_html():
-            # task_id 挂上跳转到 /task/<task_id> 的链接
+            # task_id 挂上跳转到 /task/<task_id> 的链接，并根据定时任务属性显示父/子图标
+            icon_html = ""
+            schedule_id = running_task.get("schedule_id")
+            if schedule_id:
+                if str(schedule_id) == str(data["task_id"]):
+                    icon_html = '<span class="iconfont icon-fu" style="margin-right:4px;"></span>'
+                else:
+                    icon_html = '<span class="iconfont icon-zi" style="margin-right:4px;"></span>'
             task_link = (
-                f"<a href=\"/task/{escape(str(data['task_id']))}\">"
+                f"{icon_html}<a href=\"/task/{escape(str(data['task_id']))}\">"
                 f"{escape(str(data['task_id']))}</a>"
             )
             rows = [
@@ -1335,7 +2017,11 @@ def get_current_status():
                 )
             html = f"""
             <html>
-              <head><meta charset="utf-8"><title>当前状态</title></head>
+              <head>
+                <meta charset="utf-8">
+                <title>当前状态</title>
+                <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
+              </head>
               <body>
                 <h1>当前运行任务</h1>
                 {notice_html}
@@ -1357,7 +2043,7 @@ def get_current_status():
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT task_id, state, progress, created_at, user_id_list, command, error, result
+            SELECT task_id, state, progress, created_at, user_id_list, command, error, result, schedule_id
             FROM tasks
             ORDER BY created_at DESC
             LIMIT 1
@@ -1389,11 +2075,22 @@ def get_current_status():
 
     if wants_html():
         rows = []
+        # 预先计算最近任务的父/子图标（如果存在）
+        last_icon_html = ""
+        if last_task:
+            lt_id = str(last_task.get("task_id") or "")
+            schedule_id = last_task.get("schedule_id")
+            if schedule_id:
+                if str(schedule_id) == lt_id:
+                    last_icon_html = '<span class="iconfont icon-fu" style="margin-right:4px;"></span>'
+                else:
+                    last_icon_html = '<span class="iconfont icon-zi" style="margin-right:4px;"></span>'
+
         for k, v in data.items():
-            # last_task_id 挂上跳转到 /task/<last_task_id> 的链接
+            # last_task_id 挂上跳转到 /task/<last_task_id> 的链接，并显示父/子图标
             if k == "last_task_id" and v:
                 link = (
-                    f"<a href=\"/task/{escape(str(v))}\">"
+                    f"{last_icon_html}<a href=\"/task/{escape(str(v))}\">"
                     f"{escape(str(v))}</a>"
                 )
                 rows.append(
@@ -1405,7 +2102,11 @@ def get_current_status():
                 )
         html = f"""
         <html>
-          <head><meta charset="utf-8"><title>当前状态</title></head>
+          <head>
+            <meta charset="utf-8">
+            <title>当前状态</title>
+            <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
+          </head>
           <body>
             <h1>当前状态</h1>
             <table border="1" cellspacing="0" cellpadding="4">
@@ -1589,7 +2290,11 @@ def get_weibo_detail(weibo_id):
         logger.exception(e)
         return {"error": str(e)}, 500
 
+
+
 if __name__ == "__main__":
-    logger.info("服务启动，仅提供 Web 管理界面，不自动启动爬虫任务")
+    # 服务启动时，根据 config.json 自动决定是否恢复定时任务
+    _auto_start_scheduler_on_boot()
+    logger.info("服务启动，提供 Web 管理界面，如已配置定时任务将自动恢复调度")
     # 启动Flask应用
     app.run(debug=True, use_reloader=False)  # 关闭reloader避免启动两次

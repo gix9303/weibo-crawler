@@ -2061,27 +2061,10 @@ class Weibo(object):
                 writer.writerow(header)
                 writer.writerows(rows)
 
-            # 2）按每条微博拆分导出：<用户昵称>_<weibo_id>_comments.csv
-            #    满足“用户昵称 + weiboId + comments”的文件命名要求
-            comments_by_weibo = {}
-            for row in rows:
-                weibo_id = row[1]
-                comments_by_weibo.setdefault(weibo_id, []).append(row)
-
-            for weibo_id, weibo_rows in comments_by_weibo.items():
-                per_weibo_path = os.path.join(
-                    user_dir, f"{safe_screen_name}_{weibo_id}_comments.csv"
-                )
-                with open(per_weibo_path, "w", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(header)
-                    writer.writerows(weibo_rows)
-
             logger.info(
-                "共导出 %d 条评论到用户汇总 CSV: %s，并按每条微博拆分生成 %d 个评论 CSV",
+                "共导出 %d 条评论到用户汇总 CSV: %s",
                 len(rows),
                 out_path,
-                len(comments_by_weibo),
             )
         except Exception as e:
             logger.exception(e)
