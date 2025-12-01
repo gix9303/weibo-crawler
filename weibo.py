@@ -737,6 +737,9 @@ class Weibo(object):
             MAX_TRY_COUNT = 3
             detected_extension = None
             while try_count < MAX_TRY_COUNT:
+                # 每次尝试前检查一次是否需要停止
+                if self.stop_checker:
+                    self.stop_checker()
                 try:
                     response = s.get(
                         url, headers=self.headers, timeout=(5, 10), verify=False
@@ -803,6 +806,9 @@ class Weibo(object):
                     try_count += 1
                     logger.error(f"[ERROR] 请求失败，错误信息：{e}。尝试次数：{try_count}/{MAX_TRY_COUNT}")
                     sleep_time = 2 ** try_count  # 指数退避
+                    # 进入长时间 sleep 前再次检查是否需要停止
+                    if self.stop_checker:
+                        self.stop_checker()
                     sleep(sleep_time)
                 except Exception as e:
                     logger.exception(f"[ERROR] 下载过程中发生错误: {e}")
@@ -933,6 +939,9 @@ class Weibo(object):
             # 检查是否有文件需要下载
             has_files = False
             for w in self.weibo[wrote_count:]:
+                # 扫描阶段也允许中途停止
+                if self.stop_checker:
+                    self.stop_checker()
                 if weibo_type == "retweet":
                     if w.get("retweet"):
                         w = w["retweet"]
@@ -947,6 +956,9 @@ class Weibo(object):
                     os.makedirs(file_dir)
                 
                 for w in tqdm(self.weibo[wrote_count:], desc="Download progress"):
+                    # 每个文件下载前检查一次是否需要停止
+                    if self.stop_checker:
+                        self.stop_checker()
                     if weibo_type == "retweet":
                         if w.get("retweet"):
                             w = w["retweet"]
@@ -2004,6 +2016,9 @@ class Weibo(object):
         if "sqlite" not in self.write_mode or not self.download_comment:
             return
         try:
+            # 导出前检查一次是否需要停止
+            if self.stop_checker:
+                self.stop_checker()
             db_path = self.get_sqlte_path()
             if not os.path.exists(db_path):
                 logger.warning("导出评论失败，未找到SQLite数据库: %s", db_path)
@@ -2079,10 +2094,14 @@ class Weibo(object):
             return
         con = self.get_sqlite_connection()
         for comment in comments:
+            if self.stop_checker:
+                self.stop_checker()
             data = self.parse_sqlite_comment(comment, weibo)
             self.sqlite_insert(con, data, "comments")
             if "comments" in comment and isinstance(comment["comments"], list):
                 for c in comment["comments"]:
+                    if self.stop_checker:
+                        self.stop_checker()
                     data = self.parse_sqlite_comment(c, weibo)
                     self.sqlite_insert(con, data, "comments")
         con.close()
@@ -2092,6 +2111,8 @@ class Weibo(object):
             return
         con = self.get_sqlite_connection()
         for repost in reposts:
+            if self.stop_checker:
+                self.stop_checker()
             data = self.parse_sqlite_repost(repost, weibo)
             self.sqlite_insert(con, data, "reposts")
 
@@ -2155,6 +2176,9 @@ class Weibo(object):
             pic_full_path = os.path.join(pic_path, pic_name)
             if not os.path.exists(pic_full_path):
                 try:
+                    # 下载评论配图前也检查一次是否需要停止
+                    if self.stop_checker:
+                        self.stop_checker()
                     response = self.session.get(pic_url, timeout=10)
                     with open(pic_full_path, "wb") as f:
                         f.write(response.content)
@@ -2408,6 +2432,9 @@ class Weibo(object):
     def write_data(self, wrote_count):
         """将爬到的信息写入文件或数据库"""
         if self.got_count > wrote_count:
+            # 在进入写出与下载阶段前检查一次是否需要停止
+            if self.stop_checker:
+                self.stop_checker()
             if "csv" in self.write_mode:
                 self.write_csv(wrote_count)
             if "json" in self.write_mode:

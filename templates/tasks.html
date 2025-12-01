@@ -25,8 +25,8 @@
       {% set state = it.state %}
       {% set command = it.command or "" %}
       {% set schedule_id = it.schedule_id %}
-      {% set delete_disabled = state in ['PENDING', 'PROGRESS'] %}
-      {% set stop_disabled = not (state in ['PENDING', 'PROGRESS'] and command != 'STOP') %}
+      {% set delete_disabled = it.delete_disabled %}
+      {% set stop_disabled = it.stop_disabled %}
 
       {% set icon_class = "" %}
       {% if schedule_id %}

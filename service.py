@@ -1740,14 +1740,27 @@ def list_tasks():
     if request.method == 'POST':
         task_id = request.form.get('task_id')
         if task_id:
-            # 仅删除非运行中任务
+            # 仅删除真正“运行中的任务”：
+            # - 通过 get_running_task() 判断当前是否有任务在跑
+            # - 只有当要删除的 task_id 等于当前运行任务且状态为 PENDING/PROGRESS 时才禁止删除
             conn = None
             try:
                 conn = sqlite3.connect(DATABASE_PATH)
                 cur = conn.cursor()
                 cur.execute("SELECT state FROM tasks WHERE task_id = ?", (task_id,))
                 row = cur.fetchone()
-                if row and row[0] not in ['PENDING', 'PROGRESS']:
+                state = row[0] if row else None
+
+                running_task_id, running_task = get_running_task()
+                is_current_running = (
+                    running_task_id is not None
+                    and str(running_task_id) == str(task_id)
+                    and state in ['PENDING', 'PROGRESS']
+                )
+
+                # 只有“当前正在运行的任务”禁止删除；其他任务（包括历史 PENDING/PROGRESS 残留）
+                # 都允许删除，避免重启后无法清理遗留任务
+                if not is_current_running:
                     cur.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
                     conn.commit()
                     # 同时删除 weibo 目录下对应的任务结果目录 weibo/<task_id>/
@@ -1797,6 +1810,8 @@ def list_tasks():
     now = datetime.now()
     base_dir = os.path.split(os.path.realpath(__file__))[0]
     for t in items:
+        t_state = t.get("state")
+        t_command = t.get("command") or ""
         t["download_expired"] = False
         try:
             end_dt = _get_task_latest_end_date(t)
@@ -1826,6 +1841,22 @@ def list_tasks():
                 t["download_expired"] = True
         except Exception as ttl_err:
             logger.warning("计算任务 %s 的下载过期状态失败: %s", t.get("task_id"), ttl_err)
+
+    # 结合当前实际运行中的任务，计算每一行的“停止/删除是否可用”状态：
+    # - stop：仅对当前正在运行的任务启用（PENDING/PROGRESS 且 command != 'STOP'）
+    # - delete：仅对当前正在运行的任务禁用，其余任务都允许删除（包括历史残留的 PENDING/PROGRESS）
+    running_task_id, running_task = get_running_task()
+    for t in items:
+        tid = str(t.get("task_id") or "")
+        state = t.get("state")
+        command = t.get("command") or ""
+        is_current_running = (
+            running_task_id is not None
+            and tid == str(running_task_id)
+            and state in ['PENDING', 'PROGRESS']
+        )
+        t["stop_disabled"] = not (is_current_running and command != 'STOP')
+        t["delete_disabled"] = bool(is_current_running)
 
     if wants_html():
         # 简单分页：每页 10 条
