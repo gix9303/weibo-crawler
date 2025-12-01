@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 
-{% block title %}下载定时任务结果{% endblock %}
+{% block title %}当前还没有任何微博数据，请先运行一个任务{% endblock %}
 
 {% block body %}
-<h1>下载定时任务结果</h1>
+<h1>当前还没有任何微博数据，请先运行一个任务</h1>
 <p><a href="{{ url_for('index') }}">返回首页</a> | <a href="{{ url_for('list_tasks') }}">查看所有任务</a></p>
 <table border="1" cellspacing="0" cellpadding="4">
-  <tr><th>error</th><td>{{ error }}</td></tr>
+  <tr><th>错误信息</th><td>{{ error }}</td></tr>
 </table>
 {% endblock %}

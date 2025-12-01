@@ -2088,6 +2088,12 @@ def get_weibos():
         return res, 200
     except Exception as e:
         logger.exception(e)
+        if wants_html():
+            # 统一使用 schedule_error 模板展示数据库错误等信息
+            return (
+                render_template("schedule_error.html", error=str(e)),
+                500,
+            )
         return {"error": str(e)}, 500
 
 @app.route('/weibos/<weibo_id>', methods=['GET'])
@@ -2167,6 +2173,11 @@ def get_weibo_detail(weibo_id):
         return jsonify(weibo), 200
     except Exception as e:
         logger.exception(e)
+        if wants_html():
+            return (
+                render_template("schedule_error.html", error=str(e)),
+                500,
+            )
         return {"error": str(e)}, 500
 
 
