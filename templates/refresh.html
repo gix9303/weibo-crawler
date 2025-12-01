@@ -74,6 +74,16 @@
       </td>
     </tr>
     <tr>
+      <th>PDF 导出</th>
+      <td>
+        <label>
+          <input type="checkbox" name="split_pdf_by_year" value="1"
+                 {% if split_pdf_by_year %}checked{% endif %} />
+          按年拆分 PDF（跨年时按年份分别生成 PDF）
+        </label>
+      </td>
+    </tr>
+    <tr>
       <th>定时任务</th>
       <td>
         <label>

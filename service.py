@@ -831,6 +831,8 @@ def refresh():
         notify_push_key_val = notify_cfg.get("push_key", "")
         schedule_cfg = cfg.get("schedule") or {}
         schedule_enable_val = bool(schedule_cfg.get("enable", False))
+        pdf_cfg = cfg.get("pdf") or {}
+        split_pdf_by_year_val = bool(pdf_cfg.get("split_by_year", False))
 
         return render_template(
             "refresh.html",
@@ -839,6 +841,7 @@ def refresh():
             notify_enable=notify_enable_val,
             notify_push_key=notify_push_key_val,
             schedule_enable=schedule_enable_val,
+            split_pdf_by_year=split_pdf_by_year_val,
         )
 
     # --- POST：如果是表单提交，保存页面输入并启动任务 --------------------
@@ -890,6 +893,7 @@ def refresh():
         notify_enable_val = form.get("notify_enable") is not None
         notify_push_key_val = form.get("notify_push_key", "").strip()
         schedule_enable_val = form.get("schedule_enable") is not None
+        split_pdf_by_year_val = form.get("split_pdf_by_year") is not None
 
         cfg["cookie"] = cookie_val
 
@@ -911,6 +915,13 @@ def refresh():
             schedule_cfg["interval_minutes"] = 60
         # schedule_id 在“保存并启动”时确定，这里先保留原值
         cfg["schedule"] = schedule_cfg
+
+        # PDF 导出配置：按年拆分与否
+        pdf_cfg = cfg.get("pdf") or {}
+        if not isinstance(pdf_cfg, dict):
+            pdf_cfg = {}
+        pdf_cfg["split_by_year"] = bool(split_pdf_by_year_val)
+        cfg["pdf"] = pdf_cfg
 
         # 写回 config.json（此时 schedule_id 可能还未更新，稍后在创建任务后再补写一次）
         try:

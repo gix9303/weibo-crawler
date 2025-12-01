@@ -83,6 +83,8 @@ class WeiboPdfExporter:
             raise FileNotFoundError(f"SQLite database not found: {self.db_path}")
         # 控制每条微博写入 PDF 的评论数量，优先使用传入参数，否则读取 config.json 中的 comment_by_like_count
         self.comment_limit = self._load_comment_limit(comment_limit)
+        # 是否按年拆分 PDF，从 config.json 中读取 pdf.split_by_year，默认 False
+        self.split_by_year = self._load_split_by_year()
 
     def _load_comment_limit(self, override: Optional[int]) -> int:
         """Resolve comment limit from explicit arg or config.json, fallback to 10."""
@@ -102,6 +104,20 @@ class WeiboPdfExporter:
 
         return 10
 
+    def _load_split_by_year(self) -> bool:
+        """从 config.json 读取 pdf.split_by_year 开关，默认 False。"""
+        config_path = BASE_DIR / "config.json"
+        try:
+            with config_path.open(encoding="utf-8") as f:
+                cfg = json.load(f)
+            pdf_cfg = cfg.get("pdf") or {}
+            if isinstance(pdf_cfg, dict):
+                val = pdf_cfg.get("split_by_year")
+                return bool(val)
+        except Exception:
+            pass
+        return False
+
     # --- public API ---------------------------------------------------------
 
     def export_user_timeline(
@@ -111,12 +127,15 @@ class WeiboPdfExporter:
         font_path: Optional[Path | str] = None,
     ) -> Path:
         """
-        Export timeline and comments of one user into a PDF file.
+        Export timeline and comments of one user into one or more PDF files.
+
+        - 如果该用户的微博只跨单一年份：生成单个 PDF（保持原有行为）
+        - 如果跨越多个年份：按年份拆分为多个 PDF（每个 PDF 只包含该年份的微博）
 
         :param user_id: weibo user id
         :param output_path: target pdf path; if None, auto-generate under weibo/ directory
         :param font_path: optional TTF font path for CJK text
-        :return: Path to the generated pdf
+        :return: Path to the最后一个生成的 pdf（跨年时返回最后一年的那个）
         """
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -126,12 +145,81 @@ class WeiboPdfExporter:
 
             weibos = self._load_weibos_with_comments(conn, user_id)
 
-        if output_path is None:
-            output_path = self._build_default_output_path(user, weibos)
+        # 没有微博时，仍按原逻辑生成一个空 PDF
+        if not weibos:
+            if output_path is None:
+                output_path = self._build_default_output_path(user, weibos)
+            output_path = Path(output_path)
+            self._build_pdf(user, weibos, output_path, font_path)
+            return output_path
 
-        output_path = Path(output_path)
-        self._build_pdf(user, weibos, output_path, font_path)
-        return output_path
+        # 若未开启“按年拆分”，或实际上只有单一年份，则保持原有单 PDF 行为
+        weibos_by_year: dict[int, list[WeiboPost]] = {}
+        for w in weibos:
+            year = w.created_at.year
+            weibos_by_year.setdefault(year, []).append(w)
+
+        years = sorted(weibos_by_year.keys())
+
+        if (not self.split_by_year) or len(years) == 1:
+            if output_path is None:
+                output_path = self._build_default_output_path(user, weibos)
+            output_path = Path(output_path)
+            self._build_pdf(user, weibos, output_path, font_path)
+            return output_path
+
+        # 多个年份 -> 按年拆分 PDF
+        last_path: Optional[Path] = None
+
+        if output_path is not None:
+            # 调用方指定了输出文件，例如 foo.pdf
+            # 拆分后输出为 foo_2023.pdf、foo_2024.pdf ...
+            base = Path(output_path)
+            stem = base.stem
+            suffix = base.suffix or ".pdf"
+
+            for year in years:
+                posts = weibos_by_year.get(year) or []
+                if not posts:
+                    continue
+                year_path = base.with_name(f"{stem}_{year}{suffix}")
+                self._build_pdf(user, posts, year_path, font_path)
+                last_path = year_path
+        else:
+            # 未指定输出路径：沿用默认命名规则，但针对每个年份单独计算起止日期
+            weibo_dir = BASE_DIR / "weibo"
+            weibo_dir.mkdir(exist_ok=True)
+
+            nick = user.nick_name or user.id
+            safe_nick = re.sub(r'[\\/:*?"<>|]', "_", str(nick))
+
+            for year in years:
+                posts = weibos_by_year.get(year) or []
+                if not posts:
+                    continue
+                dates = [
+                    p.created_at
+                    for p in posts
+                    if isinstance(p.created_at, datetime)
+                ]
+                if dates:
+                    start_str = min(dates).strftime("%Y-%m-%d")
+                    end_str = max(dates).strftime("%Y-%m-%d")
+                else:
+                    start_str = end_str = "unknown"
+                filename = f"{safe_nick}_{start_str}_{end_str}.pdf"
+                year_path = weibo_dir / filename
+                self._build_pdf(user, posts, year_path, font_path)
+                last_path = year_path
+
+        if last_path is None:
+            # 理论上不会走到这里，防御性兜底：退回到单文件模式
+            if output_path is None:
+                output_path = self._build_default_output_path(user, weibos)
+            last_path = Path(output_path)
+            self._build_pdf(user, weibos, last_path, font_path)
+
+        return last_path
 
     def _build_default_output_path(
         self, user: UserProfile, weibos: List[WeiboPost]
