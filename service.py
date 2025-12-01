@@ -1641,6 +1641,17 @@ def list_tasks():
                 if row and row[0] not in ['PENDING', 'PROGRESS']:
                     cur.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
                     conn.commit()
+                    # 同时删除 weibo 目录下对应的任务结果目录 weibo/<task_id>/
+                    try:
+                        import shutil
+
+                        base_dir = os.path.split(os.path.realpath(__file__))[0]
+                        task_weibo_dir = os.path.join(base_dir, "weibo", str(task_id))
+                        if os.path.isdir(task_weibo_dir):
+                            shutil.rmtree(task_weibo_dir, ignore_errors=True)
+                            logger.info("已删除任务 %s 的 weibo 目录: %s", task_id, task_weibo_dir)
+                    except Exception as fs_err:
+                        logger.warning("删除任务 %s 的 weibo 目录失败: %s", task_id, fs_err)
             except Exception as e:
                 logger.warning("删除任务 %s 失败: %s", task_id, e)
             finally:
