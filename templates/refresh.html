@@ -4,6 +4,7 @@
 
 {% block body %}
 <h1>刷新任务（配置编辑）</h1>
+<p><a href="{{ url_for('index') }}">返回首页</a></p>
 
 <form method="post" action="{{ url_for('refresh') }}">
   <h2>用户列表</h2>
@@ -89,8 +90,6 @@
   <button type="submit" name="action" value="save_and_run">保存配置并启动任务</button>
 </form>
 
-<p><a href="{{ url_for('index') }}">返回首页</a></p>
-
 <script>
   function togglePushKey() {
       var cb = document.getElementById('notify_enable');
@@ -126,4 +125,3 @@
 </script>
 
 {% endblock %}
-

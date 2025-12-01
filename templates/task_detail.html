@@ -11,7 +11,17 @@
   {% endif %}
   {{ task_title }}
 </h1>
-
+<p>
+  {% if can_stop %}
+    <form method="post"
+          action="{{ url_for('stop_task', task_id=task_id) }}"
+          style="display:inline;">
+      <button type="submit" {% if stop_disabled %}disabled{% endif %}>停止该任务</button>
+    </form>
+  {% endif %}
+  <a href="{{ url_for('index') }}">返回首页</a> |
+  <a href="{{ url_for('list_tasks') }}">查看所有任务</a>
+</p>
 {{ notice_html|safe }}
 
 {% if is_child and parent_task_id %}
@@ -19,11 +29,6 @@
     <span class="iconfont icon-zi" style="margin-right:4px;"></span>
     本任务属于定时父任务
     <a href="{{ url_for('get_task_status', task_id=parent_task_id) }}">{{ parent_task_id }}</a>
-    <form method="get"
-          action="{{ url_for('get_task_status', task_id=parent_task_id) }}"
-          style="display:inline;margin-left:8px;">
-      <button type="submit">跳转父任务</button>
-    </form>
   </p>
 {% endif %}
 
@@ -36,17 +41,21 @@
   {% endfor %}
 </table>
 
-{% if can_download_weibo_dir %}
-  <p><a href="/task/{{ task_id }}/download">下载当前 weibo 目录内容</a></p>
-{% elif state in ['PENDING', 'PROGRESS'] %}
-  <p><span style="color: gray;">下载当前 weibo 目录内容（任务未完成，暂不可下载）</span></p>
+{# 子任务 / 普通任务：下载当前任务的爬取数据 #}
+{% if not is_parent %}
+  {% if can_download_weibo_dir %}
+    <p><a href="/task/{{ task_id }}/download">点击下载爬取的数据</a></p>
+  {% elif state in ['PENDING', 'PROGRESS'] %}
+    <p><span style="color: gray;">点击下载爬取的数据（任务未完成，暂不可下载）</span></p>
+  {% endif %}
 {% endif %}
 
+{# 父任务：下载整个定时任务聚合后的爬取数据 #}
 {% if is_parent %}
   {% if has_running_child %}
-    <p><span style="color: gray;">下载该定时任务的聚合结果（存在运行中的子任务，暂不可下载）</span></p>
+    <p><span style="color: gray;">点击下载爬取的数据（存在运行中的子任务，暂不可下载）</span></p>
   {% else %}
-    <p><a href="/schedule/download?schedule_id={{ task_id }}">下载该定时任务的聚合结果</a></p>
+    <p><a href="/schedule/download?schedule_id={{ task_id }}">点击下载爬取的数据</a></p>
   {% endif %}
 {% endif %}
 
@@ -63,7 +72,7 @@
   </ul>
 {% endif %}
 
-{% if prev_task_id or next_task_id %}
+{% if (prev_task_id or next_task_id) and not is_parent %}
   <p>
     {% if prev_task_id %}
       <a href="{{ url_for('get_task_status', task_id=prev_task_id) }}">上一条任务</a>
@@ -74,16 +83,4 @@
     {% endif %}
   </p>
 {% endif %}
-
-<p>
-  {% if can_stop %}
-    <form method="post"
-          action="{{ url_for('stop_task', task_id=task_id) }}"
-          style="display:inline;">
-      <button type="submit" {% if stop_disabled %}disabled{% endif %}>停止该任务</button>
-    </form>
-  {% endif %}
-  <a href="{{ url_for('index') }}">返回首页</a> |
-  <a href="{{ url_for('list_tasks') }}">查看所有任务</a>
-</p>
 {% endblock %}

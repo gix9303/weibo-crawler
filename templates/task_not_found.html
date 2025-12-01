@@ -4,9 +4,8 @@
 
 {% block body %}
 <h1>任务 {{ task_id }} 未找到</h1>
+<p><a href="{{ url_for('index') }}">返回首页</a> | <a href="{{ url_for('list_tasks') }}">查看所有任务</a></p>
 <table border="1" cellspacing="0" cellpadding="4">
   <tr><th>error</th><td>{{ error }}</td></tr>
 </table>
-<p><a href="{{ url_for('index') }}">返回首页</a> | <a href="{{ url_for('list_tasks') }}">查看所有任务</a></p>
 {% endblock %}
-

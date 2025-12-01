@@ -4,6 +4,10 @@
 
 {% block body %}
 <h1>微博详情</h1>
+<p>
+  <a href="{{ url_for('get_weibos') }}">返回微博列表</a> |
+  <a href="{{ url_for('index') }}">返回首页</a>
+</p>
 <table border="1" cellspacing="0" cellpadding="4">
   {% for k, v in weibo.items() %}
     {% if not is_link_field(k) %}
@@ -26,10 +30,4 @@
     {% endif %}
   </p>
 {% endif %}
-
-<p>
-  <a href="{{ url_for('get_weibos') }}">返回微博列表</a> |
-  <a href="{{ url_for('index') }}">返回首页</a>
-</p>
 {% endblock %}
-

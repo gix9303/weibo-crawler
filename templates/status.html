@@ -5,6 +5,11 @@
 {% block body %}
 {% if running %}
   <h1>当前运行任务</h1>
+  <p>
+    {{ stop_button_html|safe }}
+    <a href="{{ url_for('index') }}">返回首页</a> |
+    <a href="{{ url_for('list_tasks') }}">查看所有任务</a>
+  </p>
   {{ notice_html|safe }}
   <table border="1" cellspacing="0" cellpadding="4">
     <tr>
@@ -21,13 +26,12 @@
     <tr><th>created_at</th><td>{{ data.created_at }}</td></tr>
     <tr><th>user_id_list</th><td>{{ data.user_id_list }}</td></tr>
   </table>
+{% else %}
+  <h1>当前状态</h1>
   <p>
-    {{ stop_button_html|safe }}
     <a href="{{ url_for('index') }}">返回首页</a> |
     <a href="{{ url_for('list_tasks') }}">查看所有任务</a>
   </p>
-{% else %}
-  <h1>当前状态</h1>
   <table border="1" cellspacing="0" cellpadding="4">
     {% for k, v in data.items() %}
       {% if k == "last_task_id" and v %}
@@ -45,10 +49,5 @@
       {% endif %}
     {% endfor %}
   </table>
-  <p>
-    <a href="{{ url_for('index') }}">返回首页</a> |
-    <a href="{{ url_for('list_tasks') }}">查看所有任务</a>
-  </p>
 {% endif %}
 {% endblock %}
-
