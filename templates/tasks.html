@@ -43,6 +43,19 @@
             <span class="iconfont {{ icon_class }}" style="margin-right:4px;"></span>
           {% endif %}
           <a href="{{ url_for('get_task_status', task_id=tid) }}">{{ tid }}</a>
+          {% if it.download_expired %}
+            <span style="
+               margin-left:8px;
+               padding:2px 8px;
+               border-radius:999px;
+               background:#e0e0e0;
+               color:#666;
+               font-size:12px;
+               display:inline-block;
+            ">
+              下载超过7天，已经删除
+            </span>
+          {% endif %}
         </td>
         <td>{{ state }}</td>
         <td>{{ it.progress }}</td>

@@ -43,10 +43,12 @@
 
 {# 子任务 / 普通任务：下载当前任务的爬取数据 #}
 {% if not is_parent %}
-  {% if can_download_weibo_dir %}
+  {% if can_download_weibo_dir and not download_expired %}
     <p><a href="/task/{{ task_id }}/download">点击下载爬取的数据</a></p>
   {% elif state in ['PENDING', 'PROGRESS'] %}
     <p><span style="color: gray;">点击下载爬取的数据（任务未完成，暂不可下载）</span></p>
+  {% elif download_expired %}
+    <p><span style="color: gray;">点击下载爬取的数据（超过7天，已删除）</span></p>
   {% endif %}
 {% endif %}
 
@@ -54,6 +56,8 @@
 {% if is_parent %}
   {% if has_running_child %}
     <p><span style="color: gray;">点击下载爬取的数据（存在运行中的子任务，暂不可下载）</span></p>
+  {% elif download_expired %}
+    <p><span style="color: gray;">点击下载爬取的数据（超过7天，已删除）</span></p>
   {% else %}
     <p><a href="/schedule/download?schedule_id={{ task_id }}">点击下载爬取的数据</a></p>
   {% endif %}

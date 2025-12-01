@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import uuid
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from util.notify import push_deer
 import re
@@ -375,6 +375,41 @@ def _extract_user_ids_from_config(config: dict) -> list[str]:
                 if s:
                     ids.append(s)
     return ids
+
+
+def _get_task_latest_end_date(task: dict) -> datetime | None:
+    """
+    从任务的 user_id_list 中解析出最新的 end_date（若存在）。
+    end_date 可能是 'YYYY-MM-DD' 或 'YYYY-MM-DDTHH:MM:SS' 形式。
+    """
+    ul = task.get("user_id_list")
+    if not isinstance(ul, list):
+        return None
+    latest: datetime | None = None
+    for entry in ul:
+        if not isinstance(entry, dict):
+            continue
+        end_val = entry.get("end_date")
+        if not end_val:
+            continue
+        s = str(end_val).strip()
+        if not s:
+            continue
+        dt: datetime | None = None
+        try:
+            # 优先按 ISO 格式解析（包含 'T' 的情况）
+            dt = datetime.fromisoformat(s)
+        except Exception:
+            try:
+                # 回退到简单日期格式
+                dt = datetime.strptime(s, "%Y-%m-%d")
+            except Exception:
+                dt = None
+        if not dt:
+            continue
+        if (latest is None) or (dt > latest):
+            latest = dt
+    return latest
 
 
 def _resolve_user_names_for_notification(config: dict) -> str:
@@ -1563,10 +1598,21 @@ def get_task_status(task_id):
                         }
                     )
         # 下载当前任务 weibo 目录内容：
-        # - SUCCESS：正常可点
+        # - SUCCESS 且未过期：正常可点
+        # - SUCCESS 且超过7天：灰色提示，按钮不可点
         # - PENDING/PROGRESS：灰色提示，按钮不可点
         state = task.get('state')
         can_download_weibo_dir = state == 'SUCCESS'
+        download_expired = False
+        if state == 'SUCCESS':
+            try:
+                end_dt = _get_task_latest_end_date(task)
+                if end_dt and (datetime.now() - end_dt) > timedelta(days=7):
+                    download_expired = True
+            except Exception as ttl_err:
+                logger.warning(
+                    "计算任务 %s 在详情页的下载过期状态失败: %s", task_id, ttl_err
+                )
 
         # 如果任务仍在运行，则提供“停止该任务”的按钮；
         # 当 command 已为 STOP 时，按钮置灰不可用
@@ -1611,6 +1657,7 @@ def get_task_status(task_id):
             child_tasks=child_tasks,
             has_running_child=has_running_child,
             can_download_weibo_dir=can_download_weibo_dir,
+            download_expired=download_expired,
             can_stop=can_stop,
             stop_disabled=stop_disabled,
             notice_html=notice_html,
@@ -1682,6 +1729,42 @@ def list_tasks():
     finally:
         if conn:
             conn.close()
+
+    # 根据 end_date 判断是否已超过 7 天，若是则自动删除对应 weibo 目录，
+    # 并在任务字典上标记 download_expired 以便在列表中展示提示。
+    now = datetime.now()
+    base_dir = os.path.split(os.path.realpath(__file__))[0]
+    for t in items:
+        t["download_expired"] = False
+        try:
+            end_dt = _get_task_latest_end_date(t)
+            if not end_dt:
+                continue
+            if (now - end_dt) > timedelta(days=7):
+                # 超过 7 天，认为下载数据应被自动清理
+                task_id = t.get("task_id")
+                task_weibo_dir = os.path.join(base_dir, "weibo", str(task_id))
+                if os.path.isdir(task_weibo_dir):
+                    try:
+                        import shutil
+
+                        shutil.rmtree(task_weibo_dir, ignore_errors=True)
+                        logger.info(
+                            "任务 %s 的 weibo 目录因超过7天自动删除: %s",
+                            task_id,
+                            task_weibo_dir,
+                        )
+                    except Exception as fs_err:
+                        logger.warning(
+                            "自动删除任务 %s 的 weibo 目录失败: %s",
+                            task_id,
+                            fs_err,
+                        )
+                # 无论目录是否存在，只要超过 7 天，都标记为已删除
+                t["download_expired"] = True
+        except Exception as ttl_err:
+            logger.warning("计算任务 %s 的下载过期状态失败: %s", t.get("task_id"), ttl_err)
+
     if wants_html():
         # 如果通过 stopped 参数传入任务ID，则在页面上给出“任务已终止”的提示
         notice_html = ""
