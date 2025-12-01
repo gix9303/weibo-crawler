@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 
-{% block title %}刷新任务（配置编辑）{% endblock %}
+{% block title %}配置{% endblock %}
 
 {% block body %}
-<h1>刷新任务（配置编辑）</h1>
+<h1>配置</h1>
 <p><a href="{{ url_for('index') }}">返回首页</a></p>
 
 <form method="post" action="{{ url_for('refresh') }}">
@@ -47,7 +47,11 @@
       {% endfor %}
     </tbody>
   </table>
-  <button type="button" onclick="addUserRow()">新增用户</button>
+  <button type="button"
+          onclick="addUserRow()"
+          style="background-color:#007bff;color:#fff;border:1px solid #007bff;border-radius:4px;padding:4px 10px;cursor:pointer;margin:0;">
+    新增用户
+  </button>
 
   <h2>其他配置</h2>
   <table border="1" cellspacing="0" cellpadding="4">
@@ -58,13 +62,13 @@
       </td>
     </tr>
     <tr>
-      <th>notify</th>
+      <th>PushDeer</th>
       <td>
         <label style="margin-right: 8px;">
           <input type="checkbox" id="notify_enable" name="notify_enable" value="1"
                  {% if notify_enable %}checked{% endif %}
                  onchange="togglePushKey()" />
-          启用通知
+          启用 PushDeer 通知
         </label>
         <span id="notify_push_key_container" style="display:none;">
           push_key:
@@ -96,8 +100,18 @@
   </table>
 
   <br/>
-  <button type="submit" name="action" value="save">仅保存配置</button>
-  <button type="submit" name="action" value="save_and_run">保存配置并启动任务</button>
+  <button type="submit"
+          name="action"
+          value="save"
+          style="background-color:#007bff;color:#fff;border:1px solid #007bff;border-radius:4px;padding:4px 10px;cursor:pointer;margin:0 6px 0 0;">
+    仅保存配置
+  </button>
+  <button type="submit"
+          name="action"
+          value="save_and_run"
+          style="background-color:#007bff;color:#fff;border:1px solid #007bff;border-radius:4px;padding:4px 10px;cursor:pointer;margin:0;">
+    保存配置并启动任务
+  </button>
 </form>
 
 <script>
