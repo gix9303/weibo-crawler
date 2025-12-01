@@ -26,7 +26,9 @@ import re
 
 # 1896820725 天津股侠 2024-12-09T16:47:04
 
-DATABASE_PATH = "./weibo/weibodata.db"
+# 始终以当前脚本所在目录为基准存放 SQLite 文件，避免工作目录变化导致路径错误
+BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
+DATABASE_PATH = os.path.join(BASE_DIR, "weibo", "weibodata.db")
 
 # 如果日志文件夹不存在，则创建；exist_ok=True 避免多进程并发创建时报错
 if not os.path.isdir("log/"):

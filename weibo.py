@@ -2306,7 +2306,9 @@ class Weibo(object):
         connection.commit()
 
     def get_sqlte_path(self):
-        return "./weibo/weibodata.db"
+        # 与 service.py 中的 DATABASE_PATH 保持一致：始终以当前脚本所在目录为基准
+        base_dir = os.path.split(os.path.realpath(__file__))[0]
+        return os.path.join(base_dir, "weibo", "weibodata.db")
 
     def get_sqlite_create_sql(self):
         create_sql = """
