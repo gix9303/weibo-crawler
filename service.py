@@ -26,11 +26,11 @@ import re
 
 # 1896820725 天津股侠 2024-12-09T16:47:04
 
-DATABASE_PATH = './weibo/weibodata.db'
+DATABASE_PATH = "./weibo/weibodata.db"
 
-# 如果日志文件夹不存在，则创建
+# 如果日志文件夹不存在，则创建；exist_ok=True 避免多进程并发创建时报错
 if not os.path.isdir("log/"):
-    os.makedirs("log/")
+    os.makedirs("log/", exist_ok=True)
 logging_path = os.path.split(os.path.realpath(__file__))[0] + os.sep + "logging.conf"
 logging.config.fileConfig(logging_path)
 logger = logging.getLogger("api")

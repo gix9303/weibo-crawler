@@ -6,3 +6,4 @@ Requests==2.32.4
 schedule==1.2.1
 tqdm==4.66.3
 requests>=2.31.0
+Flask==3.0.3
