@@ -1,4 +1,3 @@
-version: '3'
 services:
   weibo-web:
     build:
