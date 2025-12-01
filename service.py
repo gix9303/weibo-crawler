@@ -1274,6 +1274,26 @@ def download_schedule_results():
         if not schedule_id:
             raise ValueError("未找到任何带有 schedule_id 的任务")
 
+        # 若该定时任务中仍有运行中的任务（父任务或其子任务），则拒绝下载
+        cur.execute(
+            """
+            SELECT COUNT(1)
+            FROM tasks
+            WHERE (schedule_id = ? OR task_id = ?)
+              AND state IN ('PENDING', 'PROGRESS')
+            """,
+            (schedule_id, schedule_id),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            data = {"error": f"定时任务 {schedule_id} 中仍有运行中的任务，暂不可下载"}
+            if wants_html():
+                return (
+                    render_template("schedule_error.html", error=data["error"]),
+                    400,
+                )
+            return jsonify(data), 400
+
         # 聚合该 schedule 下的所有任务的 user_id_list，形成用户 ID 集合
         cur.execute(
             """

@@ -53,8 +53,8 @@
 
 {# 父任务：下载整个定时任务聚合后的爬取数据 #}
 {% if is_parent %}
-  {% if has_running_child %}
-    <p><span style="color: gray;">点击下载爬取的数据（存在运行中的子任务，暂不可下载）</span></p>
+  {% if state in ['PENDING', 'PROGRESS'] or has_running_child %}
+    <p><span style="color: gray;">点击下载爬取的数据（存在运行中的任务，暂不可下载）</span></p>
   {% elif download_expired %}
     <p><span style="color: gray;">点击下载爬取的数据（超过7天，已删除）</span></p>
   {% else %}
