@@ -7,12 +7,18 @@
 2. [配置说明](#配置说明)
 3. [API 端点](#api-端点)
     - [刷新微博数据](#刷新微博数据)
-    - [查询任务状态](#查询任务状态)
+    - [查询单个任务状态](#查询单个任务状态)
+    - [列出所有任务](#列出所有任务)
+    - [当前运行状态](#当前运行状态)
+    - [停止任务](#停止任务)
+    - [下载任务数据](#下载任务数据)
+    - [下载定时任务聚合数据](#下载定时任务聚合数据)
     - [获取所有微博](#获取所有微博)
     - [获取单条微博详情](#获取单条微博详情)
 4. [定时任务](#定时任务)
-5. [错误处理](#错误处理)
-6. [日志记录](#日志记录)
+5. [数据过期与清理](#数据过期与清理)
+6. [错误处理](#错误处理)
+7. [日志记录](#日志记录)
 
 ---
 
@@ -26,49 +32,31 @@
 
 ## 配置说明
 
-在运行 API 之前，需要配置service.py相关参数。配置项包括用户ID列表、数据库路径、日志配置、下载选项等。
+在运行 API 之前，需要配置根目录下的 `config.json`。配置项包括用户ID列表、数据库路径、日志配置、下载选项、通知和定时任务等。
 
-以下是主要配置项的说明：
+主要配置段落：
 
-```python
-config = {
-    "user_id_list": [
-        "6067225218", 
-        "1445403190"
-    ],
-    "only_crawl_original": 1,
-    "since_date": 1,
-    "start_page": 1,
-    "write_mode": [
-        "csv",
-        "json",
-        "sqlite"
-    ],
-    "original_pic_download": 0,
-    "retweet_pic_download": 0,
-    "original_video_download": 0,
-    "retweet_video_download": 0,
-    "download_comment": 0,
-    "comment_max_download_count": 100,
-    "download_repost": 0,
-    "repost_max_download_count": 100,
-    "user_id_as_folder_name": 0,
-    "remove_html_tag": 1,
-    "cookie": "your weibo cookie",
-    "mysql_config": {
-        "host": "localhost",
-        "port": 3306,
-        "user": "root",
-        "password": "123456",
-        "charset": "utf8mb4"
-    },
-    "mongodb_URI": "mongodb://[username:password@]host[:port][/[defaultauthdb][?options]]",
-    "post_config": {
-        "api_url": "https://api.example.com",
-        "api_token": ""
-    }
-}
-```
+- 顶层字段基本与原脚本 `weibo.py` 的配置一致（`user_id_list`、`only_crawl_original`、`write_mode`、`cookie` 等）。
+- 通知配置：
+
+  ```json
+  "notify": {
+    "enable": true,
+    "push_key": "your_pushdeer_key"
+  }
+  ```
+
+- 定时任务配置：
+
+  ```json
+  "schedule": {
+    "enable": true,
+    "interval_minutes": 60,
+    "schedule_id": "由 Web 界面的“保存配置并启动任务”自动写入"
+  }
+  ```
+
+`service.py` 通过 `config.json` 驱动爬虫与任务调度，不再依赖内嵌的 Python 字典配置。
 
 - **user_id_list**: 需要抓取微博的用户ID列表。
 - **only_crawl_original**: 是否仅抓取原创微博（1为是，0为否）。
@@ -96,48 +84,22 @@ config = {
 
 **URL:** `/refresh`
 
-**方法:** `POST`
+**方法:** `POST`（主要用于 Web 表单，API 客户端可参考）
 
-**描述:** 手动触发刷新指定用户的微博数据。
+**描述:** 触发一次新的刷新任务。推荐通过 Web 管理界面 `/refresh` 进行配置和启动。
 
-**请求参数:**
+**行为概述:**
 
-- `user_id_list` (可选): 需要刷新微博数据的用户ID列表。格式为JSON数组。例如：
-  ```json
-  {
-      "user_id_list": ["6067225218", "1445403190"]
-  }
-  ```
+- 当没有正在运行的任务时，创建一个新的任务记录（写入 `tasks` 表）并在后台异步执行。
+- 当已有任务在运行时，返回 409 状态：
+  - HTML 请求会渲染提示页面，引导用户跳转到当前任务详情；
+  - JSON 请求（`Accept: application/json`）会返回带有 `error` 和当前 `task_id` 的 JSON。
 
 **响应:**
 
-- **202 Accepted**
-  ```json
-  {
-      "task_id": "任务ID",
-      "status": "Task started",
-      "state": "PENDING",
-      "progress": 0,
-      "user_id_list": ["6067225218", "1445403190"]
-  }
-  ```
-- **400 Bad Request** (参数无效)
-  ```json
-  {
-      "error": "Invalid user_id_list parameter"
-  }
-  ```
-- **409 Conflict** (已有任务在运行)
-  ```json
-  {
-      "task_id": "当前运行的任务ID",
-      "status": "Task already running",
-      "state": "PROGRESS",
-      "progress": 50
-  }
-  ```
+表单模式下通常返回 302 重定向到 `/status`。JSON 客户端应检查状态码并在 409 时读取返回的错误信息。
 
-### 查询任务状态
+### 查询单个任务状态
 
 **URL:** `/task/<task_id>`
 
@@ -154,11 +116,12 @@ config = {
 - **200 OK**
   ```json
   {
-      "state": "任务状态",
-      "progress": 进度百分比,
-      "result": {
-          "message": "微博列表已刷新"
-      }
+      "task_id": "任务ID",
+      "state": "SUCCESS",
+      "progress": 100,
+      "created_at": "2025-01-01T12:00:00",
+      "user_id_list": [...],
+      "result": "微博列表已刷新"
   }
   ```
   或者在任务失败时：
@@ -175,6 +138,119 @@ config = {
       "error": "Task not found"
   }
   ```
+
+### 列出所有任务
+
+**URL:** `/tasks`
+
+**方法:** `GET`
+
+**描述:** 按创建时间倒序列出所有任务。
+
+**响应:**
+
+- **200 OK**
+
+  ```json
+  [
+    {
+      "task_id": "任务ID",
+      "state": "SUCCESS",
+      "progress": 100,
+      "created_at": "2025-01-01T12:00:00",
+      "user_id_list": [...],
+      "command": "FINISHED",
+      "error": null,
+      "result": "微博列表已刷新",
+      "schedule_id": "父任务ID或null",
+      "download_expired": false
+    },
+    ...
+  ]
+  ```
+
+### 当前运行状态
+
+**URL:** `/status`
+
+**方法:** `GET`
+
+**描述:** 查询当前是否有任务运行，以及最近任务的摘要。
+
+**响应示例:**
+
+- 有任务运行：
+
+  ```json
+  {
+    "task_id": "当前任务ID",
+    "state": "PROGRESS",
+    "progress": 42,
+    "created_at": "2025-01-01T12:00:00",
+    "user_id_list": [...]
+  }
+  ```
+
+- 无任务运行：
+
+  ```json
+  {
+    "state": "IDLE",
+    "current_task": null,
+    "last_task_id": "最近一次任务ID",
+    "last_state": "SUCCESS",
+    "last_progress": 100,
+    "last_created_at": "2025-01-01T11:00:00"
+  }
+  ```
+
+### 停止任务
+
+**URL:** `/task/<task_id>/stop`
+
+**方法:** `POST`
+
+**描述:** 请求优雅停止指定任务。任务会在下一次安全检查点退出。
+
+**响应:**
+
+- **200 OK**
+
+  ```json
+  {
+    "message": "停止请求已发送",
+    "task_id": "任务ID"
+  }
+  ```
+
+- **400 Bad Request**（任务已结束，无法停止）  
+- **404 Not Found**（任务不存在）
+
+### 下载任务数据
+
+**URL:** `/task/<task_id>/download`
+
+**方法:** `GET`
+
+**描述:** 打包并下载指定任务的 `weibo/<task_id>/` 目录内容（ZIP 文件）。仅在任务 `state=SUCCESS` 且数据未过期时可用。
+
+**行为:**
+
+- 成功时返回 `application/zip` 附件。
+- 若任务不存在、未成功或对应目录不存在，会返回错误 JSON 或 HTML 提示。
+
+### 下载定时任务聚合数据
+
+**URL:** `/schedule/download?schedule_id=<task_id>`
+
+**方法:** `GET`
+
+**描述:** 对于定时任务的父任务（`schedule_id == task_id`），聚合该父任务及其子任务的数据，并返回 ZIP 打包结果。
+
+**行为:**
+
+- 成功时返回聚合 ZIP。
+- 如无用户信息、无可导出数据或打包异常，返回错误 JSON/HTML。
 
 ### 获取所有微博
 
@@ -243,15 +319,28 @@ config = {
 
 ## 定时任务
 
-API 启动后，会在后台启动一个定时任务线程，每隔10分钟自动触发一次刷新任务，以确保微博数据的及时更新。如果当前有任务正在运行，定时任务会跳过本次执行。
+API 启动后，会在后台启动一个简单调度线程 `_schedule_loop`，用于轮询 `config.json` 中的定时配置：
 
-**定时任务行为:**
-- 检查是否有正在运行的任务。
-- 如果没有正在运行的任务，则创建并启动一个新的刷新任务。
-- 如果有任务在运行，则等待下一个周期。
+- 仅当 `schedule.enable` 为 `true` 且存在 `schedule.schedule_id` 时，调度生效。
+- 调度间隔由 `schedule.interval_minutes` 控制，默认 60 分钟。
+- 每轮调度会检查：
+  - 是否存在运行中的任务；
+  - 距离最近一次定时任务的创建时间是否已超过 `interval_minutes`。
+- 条件满足时，会以最新的 `config.json` 为配置创建一个新的“子任务”（`schedule_id` 指向父任务 ID）。
 
-**错误处理:**
-- 如果定时任务执行过程中发生错误，会记录日志并在1分钟后重试。
+父任务及所有子任务可在 Web 界面和 `/tasks`、`/task/<task_id>` 等端点中查看。
+
+## 数据过期与清理
+
+为减少磁盘占用，API 会根据任务配置中的 `end_date` 做简单的数据过期处理：
+
+- 对于每个任务，从 `user_id_list` 中解析出最新的 `end_date`。
+- 若该日期距离当前时间超过 7 天，则视为“下载数据已过期”：
+  - 会尝试删除对应的 `weibo/<task_id>/` 目录；
+  - 在任务列表 JSON 中标记 `download_expired: true`；
+  - 任务详情页和下载端点会以灰色提示说明“超过7天，已删除”，不再提供可点击下载链接。
+
+注意：任务记录本身不会被删除，仍可通过 `/task/<task_id>` 和 `/tasks` 查询到。
 
 ## 错误处理
 

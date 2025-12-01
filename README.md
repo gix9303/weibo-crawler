@@ -659,13 +659,17 @@ python weibo.py
 本程序所有代码都位于weibo.py文件，程序主体是一个Weibo类，上述所有功能都是通过在main函数调用Weibo类实现的，默认的调用代码如下：
 
 ```python
-        if not os.path.isfile('./config.json'):
-            sys.exit(u'当前路径：%s 不存在配置文件config.json' %
-                     (os.path.split(os.path.realpath(__file__))[0] + os.sep))
-        with open('./config.json') as f:
-            config = json.loads(f.read())
-        wb = Weibo(config)
-        wb.start()  # 爬取微博信息
+if not os.path.isfile("./config.json"):
+    sys.exit(
+        u"当前路径：%s 不存在配置文件config.json"
+        % (os.path.split(os.path.realpath(__file__))[0] + os.sep)
+    )
+
+with open("./config.json", encoding="utf-8") as f:
+    config = json.loads(f.read())
+
+wb = Weibo(config)
+wb.start()  # 爬取微博信息
 ```
 
 用户可以按照自己的需求调用或修改Weibo类。
@@ -965,8 +969,34 @@ services:
 1. 在`const.py`文件中，将`'NOTIFY': False`中的`False`设为`True`；
 2. 将`'PUSH_KEY': ''`的`''`替换为`'<你的push_key>'`
 
-## API服务
+## API 服务与 Web 管理界面
 
-根目录下service.py提供了一个简单的restful api示例，运行`python service.py`启动服务后可以通过http请求定时更新以及查询微博
+根目录下 `service.py` 提供了一个基于 Flask 的 Web 管理界面和 RESTful API。
 
-文档参考[API说明](./API.md)
+- 本地运行（调试）
+
+```bash
+python service.py
+```
+
+打开浏览器访问 `http://127.0.0.1:5000/`，可在页面中：
+
+- 在线编辑 `config.json`（用户列表、时间区间、cookie、通知、定时任务开关）；
+- 启动一次性任务或「保存配置并启动」定时任务；
+- 在「任务列表」「当前状态」查看进度、停止任务；
+- 在任务详情页下载本次爬取的数据。任务 `end_date` 超过 7 天后，对应 `weibo/<task_id>/` 会自动清理，列表和详情页会以灰色提示「下载超过7天，已经删除」。
+
+- HTTP API
+
+所有旧的定时刷新 / 查询能力仍可通过 HTTP 调用，接口定义见 [API 说明](./API.md)。
+
+- Docker / 生产部署
+
+项目提供 `Dockerfile` 和 `docker-compose.yml`，可通过：
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+在服务器上以 `gunicorn + nginx` 方式运行（默认监听 80 端口，配置见 `nginx.conf`）。
