@@ -4,23 +4,8 @@
     <meta charset="utf-8">
     <title>{% block title %}Weibo Crawler Service{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='iconfont/iconfont.css') }}">
-    <style>
-      nav.main-nav {
-        margin-bottom: 12px;
-      }
-      nav.main-nav a {
-        margin-right: 12px;
-      }
-    </style>
 </head>
 <body>
-<nav class="main-nav">
-  <a href="{{ url_for('index') }}">首页</a>
-  <a href="{{ url_for('refresh') }}">刷新任务</a>
-  <a href="{{ url_for('list_tasks') }}">任务列表</a>
-  <a href="{{ url_for('get_current_status') }}">当前状态</a>
-  <a href="{{ url_for('get_weibos') }}">微博列表</a>
-</nav>
 {% block body %}{% endblock %}
 </body>
 </html>
