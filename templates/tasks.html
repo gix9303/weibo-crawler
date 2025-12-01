@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}任务列表{% endblock %}
+
+{% block body %}
+<h1>任务列表</h1>
+{{ notice_html|safe }}
+
+<form method="post" action="{{ url_for('list_tasks') }}">
+  <table border="1" cellspacing="0" cellpadding="4">
+    <thead>
+      <tr>
+        <th>task_id</th>
+        <th>state</th>
+        <th>progress</th>
+        <th>created_at</th>
+        <th>user_id_list</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for it in items %}
+      {% set tid = it.task_id %}
+      {% set state = it.state %}
+      {% set command = it.command or "" %}
+      {% set schedule_id = it.schedule_id %}
+      {% set delete_disabled = state in ['PENDING', 'PROGRESS'] %}
+      {% set stop_disabled = not (state in ['PENDING', 'PROGRESS'] and command != 'STOP') %}
+
+      {% set icon_class = "" %}
+      {% if schedule_id %}
+        {% if schedule_id|string == tid|string %}
+          {% set icon_class = "icon-fu" %}
+        {% else %}
+          {% set icon_class = "icon-zi" %}
+        {% endif %}
+      {% endif %}
+
+      <tr>
+        <td>
+          {% if icon_class %}
+            <span class="iconfont {{ icon_class }}" style="margin-right:4px;"></span>
+          {% endif %}
+          <a href="{{ url_for('get_task_status', task_id=tid) }}">{{ tid }}</a>
+        </td>
+        <td>{{ state }}</td>
+        <td>{{ it.progress }}</td>
+        <td>{{ it.created_at }}</td>
+        <td>{{ it.user_id_list }}</td>
+        <td>
+          <button type="submit"
+                  formaction="{{ url_for('stop_task', task_id=tid) }}"
+                  formmethod="post"
+                  {% if stop_disabled %}disabled{% endif %}>停止</button>
+          <button type="submit"
+                  name="task_id"
+                  value="{{ tid }}"
+                  {% if delete_disabled %}disabled{% endif %}>删除</button>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</form>
+
+<p><a href="{{ url_for('index') }}">返回首页</a></p>
+{% endblock %}
+

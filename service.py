@@ -3,7 +3,16 @@ import const
 import logging
 import logging.config
 import os
-from flask import Flask, jsonify, request, redirect, send_file, send_from_directory
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    redirect,
+    send_file,
+    send_from_directory,
+    render_template,
+    url_for,
+)
 import sqlite3
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -89,31 +98,8 @@ def _is_link_field(field_name: str) -> bool:
 @app.route('/', methods=['GET'])
 def index():
     """根路径：列出所有可用接口及说明"""
-    return """
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>Weibo Crawler Service</title>
-      </head>
-      <body>
-        <h1>Weibo Crawler Service 接口列表</h1>
-        <ul>
-          <li>
-            <a href="/refresh"><strong>POST /refresh</strong></a> - 启动一次新的爬虫任务
-          </li>
-          <li>
-            <a href="/tasks"><strong>GET /tasks</strong></a> - 列出所有任务及其状态
-          </li>
-          <li>
-            <a href="/status"><strong>GET /status</strong></a> - 查看当前爬虫运行状态
-          </li>
-          <li>
-            <a href="/weibos"><strong>GET /weibos</strong></a> - 查看数据库中全部微博列表（按时间倒序）
-          </li>
-        </ul>
-      </body>
-    </html>
-    """
+    # index 页面总是返回 HTML
+    return render_template("index.html")
 
 # 添加线程池和任务状态跟踪
 executor = ThreadPoolExecutor(max_workers=1)  # 限制只有1个worker避免并发爬取
@@ -778,7 +764,7 @@ def refresh():
             cfg = {}
 
         raw_user_id_list = cfg.get("user_id_list") or []
-        rows_html = ""
+        user_rows: list[dict] = []
         if isinstance(raw_user_id_list, list):
             for item in raw_user_id_list:
                 if isinstance(item, dict):
@@ -793,30 +779,15 @@ def refresh():
                     end = ""
                 if not uid and not name and not since and not end:
                     continue
+                user_rows.append(
+                    {
+                        "user_id": uid,
+                        "screen_name": name,
+                        "since_date": since,
+                        "end_date": end,
+                    }
+                )
 
-                # 将内部格式（可能包含时间）转换为 date 控件可用的 yyyy-mm-dd
-                since_display = ""
-                end_display = ""
-                if since:
-                    since_display = since.split("T")[0]
-                if end:
-                    end_display = end.split("T")[0]
-
-                rows_html += f"""
-                <tr>
-                  <td><input type="text" name="user_id" style="width:120px;" 
-                             value="{escape(uid)}"
-                             placeholder="用户ID必填且为纯数字" /></td>
-                  <td><input type="text" name="screen_name" style="width:160px;" value="{escape(name)}" /></td>
-                  <td><input type="text" name="since_date" style="width:180px;"
-                             value="{escape(since_display)}"
-                             placeholder="必填: yyyy-mm-dd" /></td>
-                  <td><input type="text" name="end_date" style="width:180px;"
-                             value="{escape(end_display)}"
-                             placeholder="默认为当前日期" /></td>
-                  <td><button type="button" onclick="removeUserRow(this)">删除</button></td>
-                </tr>
-                """
         cookie_val = cfg.get("cookie", "")
         notify_cfg = cfg.get("notify") or {}
         notify_enable_val = bool(notify_cfg.get("enable", False))
@@ -824,106 +795,14 @@ def refresh():
         schedule_cfg = cfg.get("schedule") or {}
         schedule_enable_val = bool(schedule_cfg.get("enable", False))
 
-        checked_attr = "checked" if notify_enable_val else ""
-        schedule_checked_attr = "checked" if schedule_enable_val else ""
-
-        html = f"""
-        <html>
-          <head>
-            <meta charset="utf-8" />
-            <title>刷新任务（配置编辑）</title>
-            <script>
-              function togglePushKey() {{
-                  var cb = document.getElementById('notify_enable');
-                  var div = document.getElementById('notify_push_key_container');
-                  if (!cb) return;
-                  div.style.display = cb.checked ? 'inline-block' : 'none';
-              }}
-
-              function addUserRow() {{
-                  var tbody = document.getElementById('user_table_body');
-                  var tr = document.createElement('tr');
-                  tr.innerHTML = ''
-                    + '<td><input type="text" name="user_id" style="width:120px;" '
-                    + 'placeholder="用户ID必填且为纯数字" /></td>'
-                    + '<td><input type="text" name="screen_name" style="width:160px;" /></td>'
-                    + '<td><input type="text" name="since_date" style="width:180px;" '
-                    + 'placeholder="必填: yyyy-mm-dd" /></td>'
-                    + '<td><input type="text" name="end_date" style="width:180px;" '
-                    + 'placeholder="默认为当前日期" /></td>'
-                    + '<td><button type="button" onclick="removeUserRow(this)">删除</button></td>';
-                  tbody.appendChild(tr);
-              }}
-
-              function removeUserRow(btn) {{
-                  var tr = btn.parentNode.parentNode;
-                  tr.parentNode.removeChild(tr);
-              }}
-            </script>
-          </head>
-          <body onload="togglePushKey()">
-            <h1>刷新任务（配置编辑）</h1>
-            <form method="post" action="/refresh">
-              <h2>用户列表</h2>
-              <table border="1" cellspacing="0" cellpadding="4">
-                <thead>
-                  <tr>
-                    <th>用户ID</th>
-                    <th>昵称</th>
-                    <th>since_date</th>
-                    <th>end_date</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody id="user_table_body">
-                  {rows_html}
-                </tbody>
-              </table>
-              <button type="button" onclick="addUserRow()">新增用户</button>
-
-              <h2>其他配置</h2>
-              <table border="1" cellspacing="0" cellpadding="4">
-                <tr>
-                  <th>cookie</th>
-                  <td>
-                    <textarea name="cookie" rows="4" cols="80">{escape(str(cookie_val))}</textarea>
-                  </td>
-                </tr>
-                <tr>
-                  <th>notify</th>
-                  <td>
-                    <label style="margin-right: 8px;">
-                      <input type="checkbox" id="notify_enable" name="notify_enable" value="1" {checked_attr}
-                            onchange="togglePushKey()" />
-                      启用通知
-                    </label>
-                    <span id="notify_push_key_container" style="display:none;">
-                      push_key:
-                      <input type="text" name="notify_push_key" style="width:260px;"
-                             value="{escape(str(notify_push_key_val))}" />
-                    </span>
-                  </td>
-                </tr>
-                <tr>
-                  <th>定时任务</th>
-                  <td>
-                    <label>
-                      <input type="checkbox" id="schedule_enable" name="schedule_enable" value="1" {schedule_checked_attr} />
-                      启用定时任务（每隔 1 小时自动启动一次任务）
-                    </label>
-                  </td>
-                </tr>
-              </table>
-
-              <br/>
-              <button type="submit" name="action" value="save">仅保存配置</button>
-              <button type="submit" name="action" value="save_and_run">保存配置并启动任务</button>
-            </form>
-            <p><a href="/">返回首页</a></p>
-          </body>
-        </html>
-        """
-        return html
+        return render_template(
+            "refresh.html",
+            user_rows=user_rows,
+            cookie_val=cookie_val,
+            notify_enable=notify_enable_val,
+            notify_push_key=notify_push_key_val,
+            schedule_enable=schedule_enable_val,
+        )
 
     # --- POST：如果是表单提交，保存页面输入并启动任务 --------------------
     if not request.is_json:
@@ -1017,17 +896,38 @@ def refresh():
         # 先在锁外检查是否有正在运行的任务，避免死锁
         running_task_id, running_task = get_running_task()
         if running_task:
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>任务已在运行</title></head>
-              <body>
-                <h1>已有任务正在运行</h1>
-                <p>当前任务 ID：{escape(running_task_id)}</p>
-                <p><a href="/status">查看当前状态</a> | <a href="/tasks">查看所有任务</a> | <a href="/">返回首页</a></p>
-              </body>
-            </html>
-            """
-            return html, 409
+            if wants_html():
+                # 使用任务详情页引导用户去查看当前任务
+                return (
+                    render_template(
+                        "task_detail.html",
+                        task_id=running_task_id,
+                        task_title="任务详情(当前已有任务在运行)",
+                        response=running_task,
+                        state=running_task.get("state"),
+                        is_parent=False,
+                        is_child=False,
+                        parent_task_id=None,
+                        child_tasks=[],
+                        has_running_child=False,
+                        can_download_weibo_dir=False,
+                        can_stop=True,
+                        stop_disabled=False,
+                        notice_html=f"<p style='color:red;'>已有任务正在运行，当前任务 ID：{escape(running_task_id)}</p>",
+                        prev_task_id=None,
+                        next_task_id=None,
+                    ),
+                    409,
+                )
+            return (
+                jsonify(
+                    {
+                        "error": "已有任务正在运行",
+                        "task_id": running_task_id,
+                    }
+                ),
+                409,
+            )
 
         # 创建新任务时加锁，防止竞态
         with task_lock:
@@ -1087,19 +987,12 @@ def stop_task(task_id):
     if not task:
         data = {"error": "Task not found"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>停止任务</title></head>
-              <body>
-                <h1>任务 {escape(task_id)} 未找到</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 404
+            return (
+                render_template(
+                    "task_not_found.html", task_id=task_id, error=data["error"]
+                ),
+                404,
+            )
         return jsonify(data), 404
 
     state = task.get("state")
@@ -1107,20 +1000,36 @@ def stop_task(task_id):
         # 任务已结束，不能再停止
         msg = f"任务当前状态为 {state}，无法停止"
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>停止任务</title></head>
-              <body>
-                <h1>任务 {escape(task_id)} 无法停止</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>state</th><td>{escape(str(state))}</td></tr>
-                  <tr><th>message</th><td>{escape(msg)}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a> | <a href="/task/{escape(task_id)}">返回任务详情</a></p>
-              </body>
-            </html>
-            """
-            return html, 400
+            # 用任务详情模板展示错误信息
+            response = {
+                "task_id": task_id,
+                "state": state,
+                "progress": task.get("progress"),
+                "created_at": task.get("created_at"),
+                "user_id_list": task.get("user_id_list"),
+                "message": msg,
+            }
+            return (
+                render_template(
+                    "task_detail.html",
+                    task_id=task_id,
+                    task_title="任务详情(无法停止)",
+                    response=response,
+                    state=state,
+                    is_parent=False,
+                    is_child=False,
+                    parent_task_id=None,
+                    child_tasks=[],
+                    has_running_child=False,
+                    can_download_weibo_dir=False,
+                    can_stop=False,
+                    stop_disabled=True,
+                    notice_html="",
+                    prev_task_id=None,
+                    next_task_id=None,
+                ),
+                400,
+            )
         return jsonify({"error": msg, "state": state}), 400
 
     # 标记为 STOP，后台线程会在合适的检查点抛出 TaskStopped 结束任务
@@ -1151,38 +1060,46 @@ def download_task_weibo(task_id):
     if not task:
         data = {"error": "Task not found"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载任务结果</title></head>
-              <body>
-                <h1>任务 {escape(task_id)} 未找到</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 404
+            return (
+                render_template(
+                    "task_not_found.html", task_id=task_id, error=data["error"]
+                ),
+                404,
+            )
         return jsonify(data), 404
 
     if task.get("state") != "SUCCESS":
         msg = f"任务当前状态为 {task.get('state')}，仅在 SUCCESS 状态下才可下载 weibo 目录内容"
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载任务结果</title></head>
-              <body>
-                <h1>无法下载任务 {escape(task_id)} 的结果</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>state</th><td>{escape(str(task.get('state')))}</td></tr>
-                  <tr><th>message</th><td>{escape(msg)}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a> | <a href="/task/{escape(task_id)}">返回任务详情</a></p>
-              </body>
-            </html>
-            """
-            return html, 400
+            response = {
+                "task_id": task_id,
+                "state": task.get("state"),
+                "progress": task.get("progress"),
+                "created_at": task.get("created_at"),
+                "user_id_list": task.get("user_id_list"),
+                "message": msg,
+            }
+            return (
+                render_template(
+                    "task_detail.html",
+                    task_id=task_id,
+                    task_title="任务详情(无法下载结果)",
+                    response=response,
+                    state=task.get("state"),
+                    is_parent=False,
+                    is_child=False,
+                    parent_task_id=None,
+                    child_tasks=[],
+                    has_running_child=False,
+                    can_download_weibo_dir=False,
+                    can_stop=False,
+                    stop_disabled=True,
+                    notice_html="",
+                    prev_task_id=None,
+                    next_task_id=None,
+                ),
+                400,
+            )
         return jsonify({"error": msg, "state": task.get("state")}), 400
 
     base_dir = os.path.split(os.path.realpath(__file__))[0]
@@ -1192,19 +1109,10 @@ def download_task_weibo(task_id):
     if not os.path.isdir(task_weibo_dir):
         data = {"error": f"未找到该任务对应的结果目录: {task_weibo_dir}"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载任务结果</title></head>
-              <body>
-                <h1>下载失败</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 500
+            return (
+                render_template("schedule_error.html", error=data["error"]),
+                500,
+            )
         return jsonify(data), 500
 
     # 生成压缩包文件名：用户昵称+开始日期+结束日期+任务id前5位
@@ -1284,19 +1192,10 @@ def download_task_weibo(task_id):
         logger.exception("打包 weibo 目录失败: %s", e)
         data = {"error": f"打包 weibo 目录失败: {e}"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载任务结果</title></head>
-              <body>
-                <h1>下载失败</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 500
+            return (
+                render_template("schedule_error.html", error=data["error"]),
+                500,
+            )
         return jsonify(data), 500
 
     return send_file(
@@ -1377,19 +1276,10 @@ def download_schedule_results():
             conn.close()
         data = {"error": f"查询定时任务失败: {e}"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
-              <body>
-                <h1>下载失败</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 500
+            return (
+                render_template("schedule_error.html", error=data["error"]),
+                500,
+            )
         return jsonify(data), 500
     finally:
         if conn:
@@ -1398,19 +1288,10 @@ def download_schedule_results():
     if not user_ids:
         data = {"error": f"定时任务 {schedule_id} 下未找到任何用户信息"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
-              <body>
-                <h1>下载失败</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 404
+            return (
+                render_template("schedule_error.html", error=data["error"]),
+                404,
+            )
         return jsonify(data), 404
 
     import tempfile
@@ -1432,19 +1313,10 @@ def download_schedule_results():
         shutil.rmtree(tmp_root, ignore_errors=True)
         data = {"error": f"打开 SQLite 数据库失败: {e}"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
-              <body>
-                <h1>下载失败</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 500
+            return (
+                render_template("schedule_error.html", error=data["error"]),
+                500,
+            )
         return jsonify(data), 500
 
     # 为每个用户导出聚合微博 / 评论 CSV 和 PDF
@@ -1556,19 +1428,10 @@ def download_schedule_results():
         shutil.rmtree(tmp_root, ignore_errors=True)
         data = {"error": f"定时任务 {schedule_id} 下没有可导出的微博或评论数据"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
-              <body>
-                <h1>下载失败</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 404
+            return (
+                render_template("schedule_error.html", error=data["error"]),
+                404,
+            )
         return jsonify(data), 404
 
     zip_base = os.path.join(tmp_root, f"schedule_{schedule_id}_aggregated")
@@ -1579,19 +1442,10 @@ def download_schedule_results():
         shutil.rmtree(tmp_root, ignore_errors=True)
         data = {"error": f"打包定时任务结果失败: {e}"}
         if wants_html():
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>下载定时任务结果</title></head>
-              <body>
-                <h1>下载失败</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 500
+            return (
+                render_template("schedule_error.html", error=data["error"]),
+                500,
+            )
         return jsonify(data), 500
 
     # 不立即删除 zip 文件，让 send_file 可以访问；临时目录稍后由系统回收
@@ -1604,23 +1458,12 @@ def get_task_status(task_id):
     if not task:
         data = {'error': 'Task not found'}
         if wants_html():
-            html = f"""
-            <html>
-              <head>
-                <meta charset="utf-8">
-                <title>任务详情</title>
-                <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
-              </head>
-              <body>
-                <h1>任务 {escape(task_id)} 未找到</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                </table>
-                <p><a href="/">返回首页</a></p>
-              </body>
-            </html>
-            """
-            return html, 404
+            return (
+                render_template(
+                    "task_not_found.html", task_id=task_id, error=data["error"]
+                ),
+                404,
+            )
         return jsonify(data), 404
 
     response = {
@@ -1636,11 +1479,6 @@ def get_task_status(task_id):
         response['error'] = task.get('error')
 
     if wants_html():
-        rows = []
-        for k, v in response.items():
-            rows.append(
-                f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
-            )
         # 计算上一条 / 下一条任务（按 created_at 倒序排列）
         prev_task_id = None
         next_task_id = None
@@ -1683,26 +1521,14 @@ def get_task_status(task_id):
                 pass
         # 父子关系信息
         schedule_id = task.get("schedule_id")
-        parent_info_html = ""
+        is_parent = bool(schedule_id and str(schedule_id) == task_id)
+        is_child = bool(schedule_id and str(schedule_id) != task_id)
+        parent_task_id = str(schedule_id) if is_child else None
         has_running_child = False
-        # 如果是子任务（有父任务且 schedule_id != 本任务ID），在顶部显示子任务图标和“跳转父任务”按钮
-        parent_task_id = None
-        if schedule_id and str(schedule_id) != task_id:
-            parent_task_id = str(schedule_id)
-            parent_info_html = f"""
-            <p>
-              <span class="iconfont icon-zi" style="margin-right:4px;"></span>
-              本任务属于定时父任务
-              <a href="/task/{escape(parent_task_id)}">{escape(parent_task_id)}</a>
-              <form method="get" action="/task/{escape(parent_task_id)}" style="display:inline;margin-left:8px;">
-                <button type="submit">跳转父任务</button>
-              </form>
-            </p>
-            """
 
         # 如果是父任务（schedule_id == 本任务ID），按时间轴展示所有子任务链接
-        timeline_html = ""
-        if schedule_id and str(schedule_id) == task_id:
+        child_tasks: list[dict] = []
+        if is_parent:
             try:
                 conn = sqlite3.connect(DATABASE_PATH)
                 cur = conn.cursor()
@@ -1724,64 +1550,28 @@ def get_task_status(task_id):
                     conn.close()  # type: ignore[name-defined]
                 except Exception:
                     pass
-
             if child_rows:
-                items = []
                 for cid, cstate, cprog, ccreated in child_rows:
                     if str(cstate) in ["PENDING", "PROGRESS"]:
                         has_running_child = True
-                    items.append(
-                        "<li>"
-                        f"{escape(str(ccreated))} - 子任务 "
-                        f"<a href=\"/task/{escape(str(cid))}\">{escape(str(cid))}</a> "
-                        f"(state={escape(str(cstate))}, progress={escape(str(cprog))})"
-                        "</li>"
+                    child_tasks.append(
+                        {
+                            "task_id": str(cid),
+                            "state": str(cstate),
+                            "progress": cprog,
+                            "created_at": str(ccreated),
+                        }
                     )
-                timeline_html = (
-                    "<h2>子任务时间轴</h2>"
-                    "<ul>"
-                    + "".join(items)
-                    + "</ul>"
-                )
         # 下载当前任务 weibo 目录内容：
         # - SUCCESS：正常可点
         # - PENDING/PROGRESS：灰色提示，按钮不可点
-        download_link_html = ""
         state = task.get('state')
-        if state == 'SUCCESS':
-            download_link_html = (
-                f"<p><a href=\"/task/{escape(task_id)}/download\">下载当前 weibo 目录内容</a></p>"
-            )
-        elif state in ['PENDING', 'PROGRESS']:
-            download_link_html = (
-                "<p><span style=\"color: gray;\">下载当前 weibo 目录内容（任务未完成，暂不可下载）</span></p>"
-            )
+        can_download_weibo_dir = state == 'SUCCESS'
 
-        # 若该任务本身是定时任务的父任务（schedule_id == task_id），提供聚合下载链接；
-        # 如果存在运行中的子任务，则灰色不可点击
-        schedule_link_html = ""
-        if task.get("schedule_id") and str(task.get("schedule_id")) == task_id:
-            if has_running_child:
-                schedule_link_html = (
-                    "<p><span style=\"color: gray;\">"
-                    "下载该定时任务的聚合结果（存在运行中的子任务，暂不可下载）"
-                    "</span></p>"
-                )
-            else:
-                schedule_link_html = (
-                    f"<p><a href=\"/schedule/download?schedule_id={escape(task_id)}\">"
-                    f"下载该定时任务的聚合结果</a></p>"
-                )
         # 如果任务仍在运行，则提供“停止该任务”的按钮；
         # 当 command 已为 STOP 时，按钮置灰不可用
-        stop_button_html = ""
-        if task.get('state') in ['PENDING', 'PROGRESS']:
-            stop_disabled = task.get('command') == 'STOP'
-            stop_button_html = f"""
-            <form method="post" action="/task/{escape(task_id)}/stop" style="display:inline;">
-              <button type="submit" {'disabled' if stop_disabled else ''}>停止该任务</button>
-            </form>
-            """
+        can_stop = task.get('state') in ['PENDING', 'PROGRESS']
+        stop_disabled = bool(task.get('command') == 'STOP')
         # 如果通过查询参数标记已停止，则给出提示
         notice_html = ""
         if request.args.get("stopped"):
@@ -1809,29 +1599,24 @@ def get_task_status(task_id):
         else:
             task_title = "任务详情(普通任务)"
 
-        html = f"""
-        <html>
-          <head>
-            <meta charset="utf-8">
-            <title>{escape(task_title)}</title>
-            <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
-          </head>
-            <body>
-            <h1>{escape(task_title)}</h1>
-            {notice_html}
-            {parent_info_html}
-            <table border="1" cellspacing="0" cellpadding="4">
-              {''.join(rows)}
-            </table>
-            {download_link_html}
-            {schedule_link_html}
-            {timeline_html}
-            {nav_block}
-            <p>{stop_button_html}<a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-          </body>
-        </html>
-        """
-        return html
+        return render_template(
+            "task_detail.html",
+            task_id=task_id,
+            task_title=task_title,
+            response=response,
+            state=state,
+            is_parent=is_parent,
+            is_child=is_child,
+            parent_task_id=parent_task_id,
+            child_tasks=child_tasks,
+            has_running_child=has_running_child,
+            can_download_weibo_dir=can_download_weibo_dir,
+            can_stop=can_stop,
+            stop_disabled=stop_disabled,
+            notice_html=notice_html,
+            prev_task_id=prev_task_id,
+            next_task_id=next_task_id,
+        )
 
     return jsonify(response)
 
@@ -1894,73 +1679,7 @@ def list_tasks():
             notice_html = (
                 f"<p style='color:red;'>任务 {escape(str(stopped_id))} 已终止</p>"
             )
-        header_cells = "".join(
-            f"<th>{escape(col)}</th>"
-            for col in ["task_id", "state", "progress", "created_at", "user_id_list", "操作"]
-        )
-        body_rows = []
-        for it in items:
-            tid = str(it.get('task_id'))
-            state = str(it.get('state'))
-            command = str(it.get('command') or "")
-            schedule_id = it.get('schedule_id')
-            delete_disabled = state in ['PENDING', 'PROGRESS']
-            delete_button = (
-                f"<button type=\"submit\" name=\"task_id\" value=\"{escape(tid)}\" "
-                f"{'disabled' if delete_disabled else ''}>删除</button>"
-            )
-            # 运行中的任务提供“停止”按钮，指向 /task/<task_id>/stop；
-            # 如果已发出停止命令，则按钮置灰不可用
-            stop_disabled = not (state in ['PENDING', 'PROGRESS'] and command != 'STOP')
-            stop_button = (
-                f"<button type=\"submit\" "
-                f"formaction=\"/task/{escape(tid)}/stop\" "
-                f"formmethod=\"post\" "
-                f"{'disabled' if stop_disabled else ''}>停止</button>"
-            )
-            # 根据 schedule_id 判断是否为定时父任务/子任务，在任务 ID 前显示图标
-            icon_html = ""
-            if schedule_id:
-                if str(schedule_id) == tid:
-                    # 父任务图标
-                    icon_html = '<span class="iconfont icon-fu" style="margin-right:4px;"></span>'
-                else:
-                    # 子任务图标
-                    icon_html = '<span class="iconfont icon-zi" style="margin-right:4px;"></span>'
-
-            body_rows.append(
-                "<tr>"
-                f"<td>{icon_html}<a href=\"/task/{escape(tid)}\">{escape(tid)}</a></td>"
-                f"<td>{escape(state)}</td>"
-                f"<td>{escape(str(it.get('progress')))}</td>"
-                f"<td>{escape(str(it.get('created_at')))}</td>"
-                f"<td>{escape(str(it.get('user_id_list')))}</td>"
-                f"<td>{stop_button} {delete_button}</td>"
-                "</tr>"
-            )
-        html = f"""
-            <html>
-              <head>
-                <meta charset="utf-8">
-                <title>任务列表</title>
-                <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
-              </head>
-              <body>
-            <h1>任务列表</h1>
-            {notice_html}
-            <form method="post" action="/tasks">
-              <table border="1" cellspacing="0" cellpadding="4">
-                <thead><tr>{header_cells}</tr></thead>
-                <tbody>
-                  {''.join(body_rows)}
-                </tbody>
-              </table>
-            </form>
-            <p><a href="/">返回首页</a></p>
-          </body>
-        </html>
-        """
-        return html
+        return render_template("tasks.html", items=items, notice_html=notice_html)
     return jsonify(items)
 
 
@@ -1981,25 +1700,15 @@ def get_current_status():
             'user_id_list': running_task.get('user_id_list'),
         }
         if wants_html():
-            # task_id 挂上跳转到 /task/<task_id> 的链接，并根据定时任务属性显示父/子图标
-            icon_html = ""
+            # 计算父/子图标类名
+            icon_class = ""
             schedule_id = running_task.get("schedule_id")
             if schedule_id:
                 if str(schedule_id) == str(data["task_id"]):
-                    icon_html = '<span class="iconfont icon-fu" style="margin-right:4px;"></span>'
+                    icon_class = "icon-fu"
                 else:
-                    icon_html = '<span class="iconfont icon-zi" style="margin-right:4px;"></span>'
-            task_link = (
-                f"{icon_html}<a href=\"/task/{escape(str(data['task_id']))}\">"
-                f"{escape(str(data['task_id']))}</a>"
-            )
-            rows = [
-                f"<tr><th>task_id</th><td>{task_link}</td></tr>",
-                f"<tr><th>state</th><td>{escape(str(data['state']))}</td></tr>",
-                f"<tr><th>progress</th><td>{escape(str(data['progress']))}</td></tr>",
-                f"<tr><th>created_at</th><td>{escape(str(data['created_at']))}</td></tr>",
-                f"<tr><th>user_id_list</th><td>{escape(str(data['user_id_list']))}</td></tr>",
-            ]
+                    icon_class = "icon-zi"
+
             # 对当前运行任务提供“停止该任务”按钮；当 command 已为 STOP 时置灰不可用
             stop_button_html = ""
             if data.get('state') in ['PENDING', 'PROGRESS']:
@@ -2015,24 +1724,17 @@ def get_current_status():
                 notice_html = (
                     f"<p style='color:red;'>任务 {escape(str(stopped_id))} 已终止</p>"
                 )
-            html = f"""
-            <html>
-              <head>
-                <meta charset="utf-8">
-                <title>当前状态</title>
-                <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
-              </head>
-              <body>
-                <h1>当前运行任务</h1>
-                {notice_html}
-                <table border="1" cellspacing="0" cellpadding="4">
-                  {''.join(rows)}
-                </table>
-                <p>{stop_button_html}<a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-              </body>
-            </html>
-            """
-            return html, 200
+            return (
+                render_template(
+                    "status.html",
+                    running=True,
+                    data=data,
+                    icon_class=icon_class,
+                    notice_html=notice_html,
+                    stop_button_html=stop_button_html,
+                ),
+                200,
+            )
         return jsonify(data), 200
 
     # 没有正在运行的任务，尝试给出最近一个任务的简要信息（如果有）
@@ -2074,49 +1776,28 @@ def get_current_status():
         }
 
     if wants_html():
-        rows = []
-        # 预先计算最近任务的父/子图标（如果存在）
-        last_icon_html = ""
+        # 预先计算最近任务的父/子图标类名（如果存在）
+        icon_class = ""
         if last_task:
             lt_id = str(last_task.get("task_id") or "")
             schedule_id = last_task.get("schedule_id")
             if schedule_id:
                 if str(schedule_id) == lt_id:
-                    last_icon_html = '<span class="iconfont icon-fu" style="margin-right:4px;"></span>'
+                    icon_class = "icon-fu"
                 else:
-                    last_icon_html = '<span class="iconfont icon-zi" style="margin-right:4px;"></span>'
+                    icon_class = "icon-zi"
 
-        for k, v in data.items():
-            # last_task_id 挂上跳转到 /task/<last_task_id> 的链接，并显示父/子图标
-            if k == "last_task_id" and v:
-                link = (
-                    f"{last_icon_html}<a href=\"/task/{escape(str(v))}\">"
-                    f"{escape(str(v))}</a>"
-                )
-                rows.append(
-                    f"<tr><th>{escape(str(k))}</th><td>{link}</td></tr>"
-                )
-            else:
-                rows.append(
-                    f"<tr><th>{escape(str(k))}</th><td>{escape(str(v))}</td></tr>"
-                )
-        html = f"""
-        <html>
-          <head>
-            <meta charset="utf-8">
-            <title>当前状态</title>
-            <link rel="stylesheet" href="/static/iconfont/iconfont.css" />
-          </head>
-          <body>
-            <h1>当前状态</h1>
-            <table border="1" cellspacing="0" cellpadding="4">
-              {''.join(rows)}
-            </table>
-            <p><a href="/">返回首页</a> | <a href="/tasks">查看所有任务</a></p>
-          </body>
-        </html>
-        """
-        return html, 200
+        return (
+            render_template(
+                "status.html",
+                running=False,
+                data=data,
+                icon_class=icon_class,
+                notice_html="",
+                stop_button_html="",
+            ),
+            200,
+        )
     return jsonify(data), 200
 
 @app.route('/weibos', methods=['GET'])
@@ -2134,48 +1815,19 @@ def get_weibos():
         conn.close()
         if wants_html():
             # 简单表格展示主要字段，其中 id 列可点击跳转到 /weibos/<weibo_id>
-            # 为了减少横向滚动，超长字段中间用 "..." 截断，并通过 title 展示完整内容。
             display_columns = [col for col in columns if not _is_link_field(col)]
-            header_cells = "".join(f"<th>{escape(str(col))}</th>" for col in display_columns)
-            body_rows = []
+            # 将每条微博转换为普通 dict，方便模板访问
+            simple_weibos = []
             for item in weibos:
-                row_cells = []
-                for col in display_columns:
-                    val = item.get(col)
-                    text = "" if val is None else str(val)
-                    # id 列仍然完整展示，但通常长度较短
-                    if col == "id":
-                        cell = (
-                            f"<td><a href=\"/weibos/{escape(text)}\">"
-                            f"{escape(text)}</a></td>"
-                        )
-                    else:
-                        short = _truncate_middle(text, max_len=80)
-                        title_attr = f' title="{escape(text)}"' if text else ""
-                        cell = (
-                            f"<td{title_attr}>{escape(short)}</td>"
-                        )
-                    row_cells.append(cell)
-                body_rows.append("<tr>" + "".join(row_cells) + "</tr>")
-            html = f"""
-            <html>
-              <head>
-                <meta charset="utf-8"><title>微博列表</title>
-              </head>
-              <body>
-                <h1>微博列表</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  <thead><tr>{header_cells}</tr></thead>
-                  <tbody>
-                    {''.join(body_rows)}
-                  </tbody>
-                </table>
-                <p>说明：为避免页面过宽，长文本中间已使用 "..." 截断，鼠标悬停可查看完整内容。</p>
-                <p><a href=\"/\">返回首页</a></p>
-              </body>
-            </html>
-            """
-            return html, 200
+                simple_weibos.append({k: ("" if v is None else v) for k, v in item.items()})
+            return (
+                render_template(
+                    "weibos.html",
+                    display_columns=display_columns,
+                    weibos=simple_weibos,
+                ),
+                200,
+            )
 
         res = jsonify(weibos)
         return res, 200
@@ -2195,19 +1847,14 @@ def get_weibo_detail(weibo_id):
             conn.close()
             data = {"error": "Weibo not found"}
             if wants_html():
-                html = f"""
-                <html>
-                  <head><meta charset="utf-8"><title>微博未找到</title></head>
-                  <body>
-                    <h1>微博 {escape(str(weibo_id))} 未找到</h1>
-                    <table border="1" cellspacing="0" cellpadding="4">
-                      <tr><th>error</th><td>{escape(data['error'])}</td></tr>
-                    </table>
-                    <p><a href=\"/weibos\">返回微博列表</a> | <a href=\"/\">返回首页</a></p>
-                  </body>
-                </html>
-                """
-                return html, 404
+                return (
+                    render_template(
+                        "weibo_not_found.html",
+                        weibo_id=weibo_id,
+                        error=data["error"],
+                    ),
+                    404,
+                )
             return data, 404
 
         weibo = dict(zip(columns, row))
@@ -2249,42 +1896,19 @@ def get_weibo_detail(weibo_id):
             conn.close()
         
         if wants_html():
-            rows = []
-            for k, v in weibo.items():
-                # pics、video_url 等链接类字段在 HTML 页面上不展示
-                if _is_link_field(k):
-                    continue
-                rows.append(
-                    f"<tr><th>{escape(str(k))}</th><td>{escape('' if v is None else str(v))}</td></tr>"
-                )
-
-            # 上一条 / 下一条微博导航（仅在存在时显示）
-            nav_links = []
-            if prev_weibo_id:
-                nav_links.append(
-                    f"<a href=\"/weibos/{escape(str(prev_weibo_id))}\">上一条微博</a>"
-                )
-            if next_weibo_id:
-                nav_links.append(
-                    f"<a href=\"/weibos/{escape(str(next_weibo_id))}\">下一条微博</a>"
-                )
-            nav_html = " | ".join(nav_links) if nav_links else ""
-            nav_block = f"<p>{nav_html}</p>" if nav_html else ""
-
-            html = f"""
-            <html>
-              <head><meta charset="utf-8"><title>微博详情 {escape(str(weibo_id))}</title></head>
-              <body>
-                <h1>微博详情</h1>
-                <table border="1" cellspacing="0" cellpadding="4">
-                  {''.join(rows)}
-                </table>
-                {nav_block}
-                <p><a href=\"/weibos\">返回微博列表</a> | <a href=\"/\">返回首页</a></p>
-              </body>
-            </html>
-            """
-            return html, 200
+            # 将字段值中的 None 转为空字符串，便于模板展示
+            weibo_simple = {k: ("" if v is None else v) for k, v in weibo.items()}
+            return (
+                render_template(
+                    "weibo_detail.html",
+                    weibo_id=weibo_id,
+                    weibo=weibo_simple,
+                    prev_weibo_id=prev_weibo_id,
+                    next_weibo_id=next_weibo_id,
+                    is_link_field=_is_link_field,
+                ),
+                200,
+            )
         return jsonify(weibo), 200
     except Exception as e:
         logger.exception(e)

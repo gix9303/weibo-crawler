@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+
+{% block title %}刷新任务（配置编辑）{% endblock %}
+
+{% block body %}
+<h1>刷新任务（配置编辑）</h1>
+
+<form method="post" action="{{ url_for('refresh') }}">
+  <h2>用户列表</h2>
+  <table border="1" cellspacing="0" cellpadding="4">
+    <thead>
+      <tr>
+        <th>用户ID</th>
+        <th>昵称</th>
+        <th>since_date</th>
+        <th>end_date</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="user_table_body">
+      {% for u in user_rows %}
+      <tr>
+        <td>
+          <input type="text" name="user_id" style="width:120px;"
+                 value="{{ u.user_id }}"
+                 placeholder="用户ID必填且为纯数字" />
+        </td>
+        <td>
+          <input type="text" name="screen_name" style="width:160px;"
+                 value="{{ u.screen_name or '' }}" />
+        </td>
+        <td>
+          <input type="text" name="since_date" style="width:180px;"
+                 value="{{ (u.since_date.split('T')[0] if u.since_date else '') }}"
+                 placeholder="必填: yyyy-mm-dd" />
+        </td>
+        <td>
+          <input type="text" name="end_date" style="width:180px;"
+                 value="{{ (u.end_date.split('T')[0] if u.end_date else '') }}"
+                 placeholder="默认为当前日期" />
+        </td>
+        <td>
+          <button type="button" onclick="removeUserRow(this)">删除</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <button type="button" onclick="addUserRow()">新增用户</button>
+
+  <h2>其他配置</h2>
+  <table border="1" cellspacing="0" cellpadding="4">
+    <tr>
+      <th>cookie</th>
+      <td>
+        <textarea name="cookie" rows="4" cols="80">{{ cookie_val or '' }}</textarea>
+      </td>
+    </tr>
+    <tr>
+      <th>notify</th>
+      <td>
+        <label style="margin-right: 8px;">
+          <input type="checkbox" id="notify_enable" name="notify_enable" value="1"
+                 {% if notify_enable %}checked{% endif %}
+                 onchange="togglePushKey()" />
+          启用通知
+        </label>
+        <span id="notify_push_key_container" style="display:none;">
+          push_key:
+          <input type="text" name="notify_push_key" style="width:260px;"
+                 value="{{ notify_push_key or '' }}" />
+        </span>
+      </td>
+    </tr>
+    <tr>
+      <th>定时任务</th>
+      <td>
+        <label>
+          <input type="checkbox" id="schedule_enable" name="schedule_enable" value="1"
+                 {% if schedule_enable %}checked{% endif %} />
+          启用定时任务（每隔 1 小时自动启动一次任务）
+        </label>
+      </td>
+    </tr>
+  </table>
+
+  <br/>
+  <button type="submit" name="action" value="save">仅保存配置</button>
+  <button type="submit" name="action" value="save_and_run">保存配置并启动任务</button>
+</form>
+
+<p><a href="{{ url_for('index') }}">返回首页</a></p>
+
+<script>
+  function togglePushKey() {
+      var cb = document.getElementById('notify_enable');
+      var div = document.getElementById('notify_push_key_container');
+      if (!cb || !div) return;
+      div.style.display = cb.checked ? 'inline-block' : 'none';
+  }
+
+  function addUserRow() {
+      var tbody = document.getElementById('user_table_body');
+      if (!tbody) return;
+      var tr = document.createElement('tr');
+      tr.innerHTML = ''
+        + '<td><input type="text" name="user_id" style="width:120px;" '
+        + 'placeholder="用户ID必填且为纯数字" /></td>'
+        + '<td><input type="text" name="screen_name" style="width:160px;" /></td>'
+        + '<td><input type="text" name="since_date" style="width:180px;" '
+        + 'placeholder="必填: yyyy-mm-dd" /></td>'
+        + '<td><input type="text" name="end_date" style="width:180px;" '
+        + 'placeholder="默认为当前日期" /></td>'
+        + '<td><button type="button" onclick="removeUserRow(this)">删除</button></td>';
+      tbody.appendChild(tr);
+  }
+
+  function removeUserRow(btn) {
+      var tr = btn.parentNode.parentNode;
+      if (tr && tr.parentNode) {
+          tr.parentNode.removeChild(tr);
+      }
+  }
+
+  window.onload = togglePushKey;
+</script>
+
+{% endblock %}
+

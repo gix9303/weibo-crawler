@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}微博详情 {{ weibo_id }}{% endblock %}
+
+{% block body %}
+<h1>微博详情</h1>
+<table border="1" cellspacing="0" cellpadding="4">
+  {% for k, v in weibo.items() %}
+    {% if not is_link_field(k) %}
+      <tr>
+        <th>{{ k }}</th>
+        <td>{{ '' if v is none else v }}</td>
+      </tr>
+    {% endif %}
+  {% endfor %}
+</table>
+
+{% if prev_weibo_id or next_weibo_id %}
+  <p>
+    {% if prev_weibo_id %}
+      <a href="{{ url_for('get_weibo_detail', weibo_id=prev_weibo_id) }}">上一条微博</a>
+    {% endif %}
+    {% if next_weibo_id %}
+      {% if prev_weibo_id %} | {% endif %}
+      <a href="{{ url_for('get_weibo_detail', weibo_id=next_weibo_id) }}">下一条微博</a>
+    {% endif %}
+  </p>
+{% endif %}
+
+<p>
+  <a href="{{ url_for('get_weibos') }}">返回微博列表</a> |
+  <a href="{{ url_for('index') }}">返回首页</a>
+</p>
+{% endblock %}
+

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+
+{% block title %}Weibo Crawler Service{% endblock %}
+
+{% block body %}
+<h1>Weibo Crawler Service 接口列表</h1>
+<ul>
+  <li>
+    <a href="{{ url_for('refresh') }}"><strong>POST /refresh</strong></a> - 启动一次新的爬虫任务
+  </li>
+  <li>
+    <a href="{{ url_for('list_tasks') }}"><strong>GET /tasks</strong></a> - 列出所有任务及其状态
+  </li>
+  <li>
+    <a href="{{ url_for('get_current_status') }}"><strong>GET /status</strong></a> - 查看当前爬虫运行状态
+  </li>
+  <li>
+    <a href="{{ url_for('get_weibos') }}"><strong>GET /weibos</strong></a> - 查看数据库中全部微博列表（按时间倒序）
+  </li>
+</ul>
+{% endblock %}
+
