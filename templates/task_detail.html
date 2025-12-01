@@ -26,7 +26,6 @@
 
 {% if is_child and parent_task_id %}
   <p>
-    <span class="iconfont icon-zi" style="margin-right:4px;"></span>
     本任务属于定时父任务
     <a href="{{ url_for('get_task_status', task_id=parent_task_id) }}">{{ parent_task_id }}</a>
   </p>
