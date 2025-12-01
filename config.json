@@ -1,9 +1,9 @@
 {
     "user_id_list": [
         {
-            "user_id": "7519797263",
-            "since_date": "2025-11-28T11:53:41",
-            "end_date": "2025-11-28T11:53:45"
+            "user_id": "",
+            "since_date": "",
+            "end_date": ""
         }
     ],
     "only_crawl_original": 0,
@@ -26,7 +26,7 @@
     "repost_max_download_count": 1000,
     "user_id_as_folder_name": 0,
     "remove_html_tag": 1,
-    "cookie": "_T_WM=c4d93eff0216a702c723b50ac41dc30a; ALF=1766568896; SCF=AnF8LWUY2ePVt9IwohTNIy1wfxZ1zU_PMjG3nzW-Jh_Fbl6khf1cI6fxVRkwCxiSWBcJgRP6GCstDD2ypbIfTBc.; SSOLoginState=1763976896; SUB=_2A25EIFbvDeRhGeFK4lAV-C7PzDyIHXVnXNYnrDV6PUJbktAbLVTbkW1NQtJhP4jihoJH4u9rCwlhTiNpCyfhouv9; SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9Wh24ShvaxLWM2YTDLl63wSM5JpX5KzhUgL.FoMX1KzX1h50S052dJLoIp7LxKML1KBLBKnLxKqL1hnLBoMNSKMEShqXe02E",
+    "cookie": "",
     "mysql_config": {
         "host": "localhost",
         "port": 3306,
@@ -41,12 +41,12 @@
         "api_token": ""
     },
     "notify": {
-        "enable": true,
-        "push_key": "PDU37668TNWyHsSL5gYyaOAxJhtBI9115MsMnxV9a"
+        "enable": false,
+        "push_key": ""
     },
     "schedule": {
         "enable": false,
-        "interval_minutes": 1,
-        "schedule_id": "07c884c2-4cb2-4e5d-b9f4-31b5eab131d3"
+        "interval_minutes": 60,
+        "schedule_id": ""
     }
 }
