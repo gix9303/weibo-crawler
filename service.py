@@ -1514,39 +1514,86 @@ def get_task_status(task_id):
         response['error'] = task.get('error')
 
     if wants_html():
-        # 计算上一条 / 下一条任务（按 created_at 倒序排列）
+        # 父子关系信息
+        schedule_id = task.get("schedule_id")
+        is_parent = bool(schedule_id and str(schedule_id) == task_id)
+        is_child = bool(schedule_id and str(schedule_id) != task_id)
+        parent_task_id = str(schedule_id) if is_child else None
+        has_running_child = False
+
+        # 计算上一条 / 下一条任务（按 created_at 倒序排列），
+        # 但根据任务类型控制跳转范围：
+        # - 子任务：仅在同一个父任务（同一 schedule_id 或该父任务本身）范围内跳转
+        # - 父任务和普通任务：仅在“非子任务”（schedule_id 为空或 schedule_id == task_id）之间跳转
         prev_task_id = None
         next_task_id = None
         created_at = task.get("created_at") or ""
         try:
             conn = sqlite3.connect(DATABASE_PATH)
             cur = conn.cursor()
-            # 上一条：比当前 created_at 更晚的那条中最早的（相当于列表中的上一条）
-            cur.execute(
-                """
-                SELECT task_id FROM tasks
-                WHERE created_at > ?
-                ORDER BY created_at ASC
-                LIMIT 1
-                """,
-                (created_at,),
-            )
-            row = cur.fetchone()
-            if row:
-                prev_task_id = row[0]
-            # 下一条：比当前 created_at 更早的那条中最新的（相当于列表中的下一条）
-            cur.execute(
-                """
-                SELECT task_id FROM tasks
-                WHERE created_at < ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (created_at,),
-            )
-            row = cur.fetchone()
-            if row:
-                next_task_id = row[0]
+
+            if is_child and schedule_id:
+                # 子任务：在所属父任务的任务组内（父任务 + 该父任务的所有子任务）跳转
+                parent_id = str(schedule_id)
+                # 上一条（组内，created_at 更晚）
+                cur.execute(
+                    """
+                    SELECT task_id FROM tasks
+                    WHERE created_at > ?
+                      AND (task_id = ? OR schedule_id = ?)
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """,
+                    (created_at, parent_id, parent_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    prev_task_id = row[0]
+                # 下一条（组内，created_at 更早）
+                cur.execute(
+                    """
+                    SELECT task_id FROM tasks
+                    WHERE created_at < ?
+                      AND (task_id = ? OR schedule_id = ?)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (created_at, parent_id, parent_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    next_task_id = row[0]
+            else:
+                # 父任务 + 普通任务：只在“非子任务”集合内跳转
+                # 非子任务定义：schedule_id 为空/NULL/'' 或 schedule_id == task_id
+                # 上一条（created_at 更晚）
+                cur.execute(
+                    """
+                    SELECT task_id FROM tasks
+                    WHERE created_at > ?
+                      AND (schedule_id IS NULL OR schedule_id = '' OR schedule_id = task_id)
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """,
+                    (created_at,),
+                )
+                row = cur.fetchone()
+                if row:
+                    prev_task_id = row[0]
+                # 下一条（created_at 更早）
+                cur.execute(
+                    """
+                    SELECT task_id FROM tasks
+                    WHERE created_at < ?
+                      AND (schedule_id IS NULL OR schedule_id = '' OR schedule_id = task_id)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (created_at,),
+                )
+                row = cur.fetchone()
+                if row:
+                    next_task_id = row[0]
         except Exception as e:
             logger.warning("计算任务 %s 的前后任务失败: %s", task_id, e)
         finally:
@@ -1554,12 +1601,6 @@ def get_task_status(task_id):
                 conn.close()  # type: ignore[name-defined]
             except Exception:
                 pass
-        # 父子关系信息
-        schedule_id = task.get("schedule_id")
-        is_parent = bool(schedule_id and str(schedule_id) == task_id)
-        is_child = bool(schedule_id and str(schedule_id) != task_id)
-        parent_task_id = str(schedule_id) if is_child else None
-        has_running_child = False
 
         # 如果是父任务（schedule_id == 本任务ID），按时间轴展示所有子任务链接
         child_tasks: list[dict] = []

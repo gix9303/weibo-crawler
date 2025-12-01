@@ -75,7 +75,7 @@
   </ul>
 {% endif %}
 
-{% if (prev_task_id or next_task_id) and not is_parent %}
+{% if prev_task_id or next_task_id %}
   <p>
     {% if prev_task_id %}
       <a href="{{ url_for('get_task_status', task_id=prev_task_id) }}">上一条任务</a>
