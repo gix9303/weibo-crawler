@@ -30,5 +30,15 @@
     {% endfor %}
   </tbody>
 </table>
-<p>说明：为避免页面过宽，长文本中间已使用 "..." 截断，鼠标悬停可查看完整内容。</p>
+{% if total_pages and total_pages > 1 %}
+  <p>
+    第 {{ page }} / {{ total_pages }} 页
+    {% if page > 1 %}
+      | <a href="{{ url_for('get_weibos', page=page-1) }}">上一页</a>
+    {% endif %}
+    {% if page < total_pages %}
+      | <a href="{{ url_for('get_weibos', page=page+1) }}">下一页</a>
+    {% endif %}
+  </p>
+{% endif %}
 {% endblock %}

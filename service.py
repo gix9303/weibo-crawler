@@ -1733,7 +1733,8 @@ def get_task_status(task_id):
 def list_tasks():
     """
     列出所有任务及其状态（按 created_at 倒序）。
-    只做状态查看，不会触发新的任务。
+    - HTML：每页 10 条，支持 ?page=1,2,...
+    - JSON：返回完整列表（保持兼容）
     """
     # 如果是 POST 并且带有删除参数，则删除指定任务后重定向
     if request.method == 'POST':
@@ -1827,6 +1828,21 @@ def list_tasks():
             logger.warning("计算任务 %s 的下载过期状态失败: %s", t.get("task_id"), ttl_err)
 
     if wants_html():
+        # 简单分页：每页 10 条
+        try:
+            page = int(request.args.get("page", "1") or "1")
+        except Exception:
+            page = 1
+        page = max(page, 1)
+        page_size = 10
+        total = len(items)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total > 0 else 1
+        if page > total_pages:
+            page = total_pages
+        start = (page - 1) * page_size
+        end = start + page_size
+        items_page = items[start:end]
+
         # 如果通过 stopped 参数传入任务ID，则在页面上给出“任务已终止”的提示
         notice_html = ""
         stopped_id = request.args.get("stopped")
@@ -1834,7 +1850,15 @@ def list_tasks():
             notice_html = (
                 f"<p style='color:red;'>任务 {escape(str(stopped_id))} 已终止</p>"
             )
-        return render_template("tasks.html", items=items, notice_html=notice_html)
+        return render_template(
+            "tasks.html",
+            items=items_page,
+            notice_html=notice_html,
+            page=page,
+            total_pages=total_pages,
+        )
+
+    # JSON：保持返回完整列表
     return jsonify(items)
 
 
@@ -1960,7 +1984,55 @@ def get_weibos():
     try:
         conn = sqlite3.connect(DATABASE_PATH)
         cursor = conn.cursor()
-        # 按created_at倒序查询所有微博
+
+        if wants_html():
+            # HTML 模式：分页，每页 10 条
+            try:
+                page = int(request.args.get("page", "1") or "1")
+            except Exception:
+                page = 1
+            page = max(page, 1)
+            page_size = 10
+
+            # 统计总数
+            cursor.execute("SELECT COUNT(*) FROM weibo")
+            row = cursor.fetchone()
+            total = int(row[0]) if row and row[0] is not None else 0
+            total_pages = max(1, (total + page_size - 1) // page_size) if total > 0 else 1
+            if page > total_pages:
+                page = total_pages
+
+            offset = (page - 1) * page_size
+            cursor.execute(
+                "SELECT * FROM weibo ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (page_size, offset),
+            )
+            columns = [column[0] for column in cursor.description] if cursor.description else []
+            weibos = []
+            for row in cursor.fetchall():
+                weibo = dict(zip(columns, row))
+                weibos.append(weibo)
+            conn.close()
+
+            # 简单表格展示主要字段，其中 id 列可点击跳转到 /weibos/<weibo_id>
+            display_columns = [col for col in columns if not _is_link_field(col)]
+            simple_weibos = []
+            for item in weibos:
+                simple_weibos.append(
+                    {k: ("" if v is None else v) for k, v in item.items()}
+                )
+            return (
+                render_template(
+                    "weibos.html",
+                    display_columns=display_columns,
+                    weibos=simple_weibos,
+                    page=page,
+                    total_pages=total_pages,
+                ),
+                200,
+            )
+
+        # JSON 模式：返回完整列表（保持兼容）
         cursor.execute("SELECT * FROM weibo ORDER BY created_at DESC")
         columns = [column[0] for column in cursor.description]
         weibos = []
@@ -1968,22 +2040,6 @@ def get_weibos():
             weibo = dict(zip(columns, row))
             weibos.append(weibo)
         conn.close()
-        if wants_html():
-            # 简单表格展示主要字段，其中 id 列可点击跳转到 /weibos/<weibo_id>
-            display_columns = [col for col in columns if not _is_link_field(col)]
-            # 将每条微博转换为普通 dict，方便模板访问
-            simple_weibos = []
-            for item in weibos:
-                simple_weibos.append({k: ("" if v is None else v) for k, v in item.items()})
-            return (
-                render_template(
-                    "weibos.html",
-                    display_columns=display_columns,
-                    weibos=simple_weibos,
-                ),
-                200,
-            )
-
         res = jsonify(weibos)
         return res, 200
     except Exception as e:
