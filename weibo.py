@@ -95,31 +95,9 @@ class Weibo(object):
         self.user_id_as_folder_name = config.get(
             "user_id_as_folder_name", 0
         )  # 结果目录名，取值为0或1，决定结果文件存储在用户昵称文件夹里还是用户id文件夹里
-        cookie_string = config.get("cookie")  # 微博cookie，可填可不填
-        core_cookies = {}   # 核心包
-        backup_cookies = {} # 备份
-        # Cookie清洗：提取核心字段。若后续预热失败，则回退使用原版 _T_WM/XSRF-TOKEN
-        if cookie_string and "SUB=" in cookie_string:
-            # 1. 提取核心 SUB
-            match_sub = re.search(r'SUB=(.*?)(;|$)', cookie_string)
-            if match_sub:
-                core_cookies['SUB'] = match_sub.group(1)
-            
-            # 2. 提取备份指纹
-            match_twm = re.search(r'_T_WM=(.*?)(;|$)', cookie_string)
-            if match_twm:
-                backup_cookies['_T_WM'] = match_twm.group(1)
-            
-            match_xsrf = re.search(r'XSRF-TOKEN=(.*?)(;|$)', cookie_string)
-            if match_xsrf:
-                backup_cookies['XSRF-TOKEN'] = match_xsrf.group(1)
-        
-        # 保底：如果没有提取到 SUB，说明格式特殊，全量加载
-        if not core_cookies and cookie_string:
-            for pair in cookie_string.split(';'):
-                if '=' in pair:
-                    key, value = pair.split('=', 1)
-                    core_cookies[key.strip()] = value.strip()
+
+        # 记录原始 cookie 字符串，便于后续检测配置变更并热加载新 cookie
+        self._raw_cookie_string = config.get("cookie") or ""
                     
         self.headers = {
             'Referer': 'https://m.weibo.cn/',  # 修正 Referer 为 m.weibo.cn
@@ -147,20 +125,9 @@ class Weibo(object):
         self.llm_analyzer = LLMAnalyzer(config) if config.get("llm_config") else None
         
         user_id_list = config["user_id_list"]
-        requests_session = requests.Session()
-        requests_session.cookies.update(core_cookies)
-
-        self.session = requests_session
-        try:
-            # 请求只带 SUB
-            # 服务器下发适配 m.weibo.cn 的新指纹
-            self.session.get("https://m.weibo.cn", headers=self.headers, timeout=10)
-            logger.info("Session 预热成功，服务器已下发最新指纹。")
-            
-        except Exception as e:
-            #请求失败时，启用备份
-            logger.warning(f"Session 预热失败 ({e})，正在启用备份 Cookie...")
-            self.session.cookies.update(backup_cookies) # 把旧指纹装进去救急
+        self.session = requests.Session()
+        # 初始化 session 的 cookie（支持后续热加载）
+        self._apply_cookie_to_session(self._raw_cookie_string)
 
         adapter = HTTPAdapter(max_retries=5)
         self.session.mount('http://', adapter)
@@ -371,6 +338,101 @@ class Weibo(object):
         """设置停止检查回调，签名为 callback()，如需停止可在内部抛出异常。"""
         self.stop_checker = callback
 
+    # --- Cookie 处理与热加载 -----------------------------------------------
+
+    def _apply_cookie_to_session(self, cookie_string: str):
+        """
+        将原始 cookie 字符串解析为核心 cookie，并应用到 self.session。
+        - 优先使用 SUB；若解析失败则退回全量 cookie。
+        - 预热一次 m.weibo.cn，让服务器下发最新指纹。
+        """
+        core_cookies: dict[str, str] = {}
+        backup_cookies: dict[str, str] = {}
+
+        cookie_string = cookie_string or ""
+        if cookie_string and "SUB=" in cookie_string:
+            # 1. 提取核心 SUB
+            match_sub = re.search(r"SUB=(.*?)(;|$)", cookie_string)
+            if match_sub:
+                core_cookies["SUB"] = match_sub.group(1)
+
+            # 2. 提取备份指纹
+            match_twm = re.search(r"_T_WM=(.*?)(;|$)", cookie_string)
+            if match_twm:
+                backup_cookies["_T_WM"] = match_twm.group(1)
+
+            match_xsrf = re.search(r"XSRF-TOKEN=(.*?)(;|$)", cookie_string)
+            if match_xsrf:
+                backup_cookies["XSRF-TOKEN"] = match_xsrf.group(1)
+
+        # 保底：如果没有提取到 SUB，说明格式特殊，全量加载
+        if not core_cookies and cookie_string:
+            for pair in cookie_string.split(";"):
+                if "=" in pair:
+                    key, value = pair.split("=", 1)
+                    core_cookies[key.strip()] = value.strip()
+
+        # 清空旧 cookie，避免残留无效指纹
+        try:
+            self.session.cookies.clear()
+        except Exception:
+            pass
+
+        # 应用核心 cookie
+        if core_cookies:
+            self.session.cookies.update(core_cookies)
+
+        # 预热 session：请求 m.weibo.cn 让服务器下发最新指纹
+        if core_cookies:
+            try:
+                self.session.get(
+                    "https://m.weibo.cn", headers=self.headers, timeout=10
+                )
+                logger.info("Session 预热成功，服务器已下发最新指纹。")
+                return
+            except Exception as e:
+                logger.warning(
+                    "Session 预热失败 (%s)，尝试使用备份 Cookie 继续。", e
+                )
+
+        # 预热失败或没有核心 cookie 时，尝试使用备份 cookie（若存在）
+        if backup_cookies:
+            try:
+                self.session.cookies.update(backup_cookies)
+                self.session.get(
+                    "https://m.weibo.cn", headers=self.headers, timeout=10
+                )
+                logger.info("备份 Cookie 预热成功。")
+            except Exception as e:
+                logger.warning("备份 Cookie 预热失败: %s", e)
+
+    def _reload_cookie_if_updated(self):
+        """
+        检查 config.json 中的 cookie 是否已经更新：
+        - 若 cookie 字符串发生变化，则热更新 self.session 的 cookie。
+        - 若未变化或无法读取配置，则不做任何处理。
+        """
+        try:
+            config_path = (
+                Path(os.path.realpath(__file__)).parent / "config.json"
+            )
+            if not config_path.exists():
+                return
+            with config_path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            logger.warning("热加载 Cookie 时读取 config.json 失败: %s", e)
+            return
+
+        new_cookie = (cfg.get("cookie") or "").strip()
+        if not new_cookie or new_cookie == getattr(self, "_raw_cookie_string", ""):
+            return
+
+        # 发现配置中的 cookie 已更新，应用到当前 session
+        logger.info("检测到 config.json 中的 Cookie 已更新，正在热加载新 Cookie...")
+        self._raw_cookie_string = new_cookie
+        self._apply_cookie_to_session(self._raw_cookie_string)
+
     def _notify_possible_cookie_invalid(self, reason: str):
         """
         当检测到接口连续失败、需要验证码或 ok!=1 等异常情况时，
@@ -463,6 +525,8 @@ class Weibo(object):
             # 每次重试前先检查是否需要停止任务
             if self.stop_checker:
                 self.stop_checker()
+            # 每一轮请求前尝试从 config.json 热加载最新的 Cookie（如果用户在运行中更新了配置）
+            self._reload_cookie_if_updated()
             try:
                 response = self.session.get(
                     url, params=params, headers=self.headers, timeout=10
