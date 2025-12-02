@@ -187,9 +187,9 @@ class Weibo(object):
             screen_name = item.get("screen_name") or item.get("nick_name")
             if screen_name:
                 user_cfg["screen_name"] = screen_name
-            # 可选 end_date，仅记录，不参与过滤逻辑
+            # 可选 end_date：若配置了则标准化为统一格式，便于后续时间过滤逻辑使用
             if item.get("end_date"):
-                user_cfg["end_date"] = item["end_date"]
+                user_cfg["end_date"] = self._normalize_end_date(item.get("end_date"))
             user_config_list.append(user_cfg)
 
         self.user_config_list = user_config_list  # 要爬取的微博用户的user_config列表
@@ -247,7 +247,8 @@ class Weibo(object):
             logger.warning("append模式下请将sqlite加入write_mode中")
             sys.exit()
 
-        # 验证user_id_list：只支持 list[dict]，且每个用户必须有数字 user_id 和合法 since_date
+        # 验证user_id_list：只支持 list[dict]，且每个用户必须有数字 user_id 和合法 since_date；
+        # 可选 end_date，如配置则必须为合法日期格式。
         user_id_list = config["user_id_list"]
         if not isinstance(user_id_list, list) or not user_id_list:
             logger.warning("user_id_list值应为非空的list[dict]，例如 [{\"user_id\": \"123\"}, ...]")
@@ -268,6 +269,16 @@ class Weibo(object):
             if not (self.is_datetime(token) or self.is_date(token)):
                 logger.warning("since_date格式不正确，仅支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", token)
                 sys.exit()
+            # end_date 为可选字段，如配置则校验格式
+            edate = item.get("end_date")
+            if edate is not None:
+                if not isinstance(edate, str):
+                    logger.warning("end_date 格式不正确，仅支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", edate)
+                    sys.exit()
+                e_token = edate.strip()
+                if e_token and (not (self.is_datetime(e_token) or self.is_date(e_token))):
+                    logger.warning("end_date 格式不正确，仅支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", edate)
+                    sys.exit()
 
         comment_max_count = config["comment_max_download_count"]
         if not isinstance(comment_max_count, int):
@@ -323,6 +334,29 @@ class Weibo(object):
                 return "{}T00:00:00".format(token)
 
         logger.error("since_date 格式不正确，只支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", value)
+        sys.exit()
+
+    def _normalize_end_date(self, value):
+        """
+        归一化 per-user end_date（可选）：
+        - 为空/None：返回 None，表示不限制结束时间
+        - yyyy-mm-dd：转换为当天 23:59:59（包含整天）
+        - yyyy-mm-ddTHH:MM:SS：保持原样
+        """
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            token = value.strip()
+            if not token:
+                return None
+            if self.is_datetime(token):
+                return token
+            if self.is_date(token):
+                # 结束日期用当天 23:59:59，确保该日内的所有微博都被包含
+                return "{}T23:59:59".format(token)
+
+        logger.error("end_date 格式不正确，只支持 yyyy-mm-dd 或 yyyy-mm-ddTHH:MM:SS，实际为: %s", value)
         sys.exit()
 
     def set_progress_callback(self, callback):
@@ -1475,7 +1509,14 @@ class Weibo(object):
                             end_date = None
                             if end_date_token:
                                 try:
-                                    end_date = datetime.strptime(end_date_token, DTFORMAT)
+                                    # end_date 经过 _normalize_end_date 预处理后，优先为 DTFORMAT；
+                                    # 为兼容旧配置或历史数据，这里仍同时支持 yyyy-mm-dd 与 yyyy-mm-ddTHH:MM:SS。
+                                    if self.is_datetime(end_date_token):
+                                        end_date = datetime.strptime(end_date_token, DTFORMAT)
+                                    elif self.is_date(end_date_token):
+                                        end_date = datetime.strptime(
+                                            end_date_token + "T23:59:59", DTFORMAT
+                                        )
                                 except Exception:
                                     end_date = None
                             if const.MODE == "append":
