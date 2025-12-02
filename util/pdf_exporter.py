@@ -28,7 +28,13 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import (
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Image as RLImage,
+)
 from xml.sax.saxutils import escape
 
 
@@ -350,6 +356,70 @@ class WeiboPdfExporter:
 
         return comments
 
+    # --- local image lookup -------------------------------------------------
+
+    def _build_image_index(self, search_root: Path) -> dict[str, List[Path]]:
+        """
+        在给定目录下构建一份「微博ID -> 图片文件列表」索引。
+
+        约定：
+        - weibo.py 下载图片时的文件名形如：
+          20241214_1234567890123456.jpg 或 20241214_1234567890123456_1.jpg
+        - 即文件名中倒数第二段（或仅有的第二段）为 weibo_id。
+        - 图片目录结构：
+          * 单任务：weibo/<task_id>/<用户目录>/img/*.jpg
+          * 聚合结果：<用户目录>/img/*.jpg
+        """
+        img_dirs: List[Path] = []
+        try:
+            # 情况1：聚合结果目录 <用户目录>/img
+            direct_img = search_root / "img"
+            if direct_img.is_dir():
+                img_dirs.append(direct_img)
+
+            # 情况2：任务目录 weibo/<task_id>/<用户目录>/img
+            for child in search_root.iterdir():
+                if not child.is_dir():
+                    continue
+                candidate = child / "img"
+                if candidate.is_dir():
+                    img_dirs.append(candidate)
+        except Exception:
+            # 目录扫描失败时直接返回空索引
+            return {}
+
+        exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+        index: dict[str, List[Path]] = {}
+
+        for img_dir in img_dirs:
+            try:
+                for p in img_dir.iterdir():
+                    if not p.is_file():
+                        continue
+                    if p.suffix.lower() not in exts:
+                        continue
+                    stem = p.stem  # 形如 20241214_1234567890123456 或 20241214_1234567890123456_1
+                    parts = stem.split("_")
+                    if len(parts) < 2:
+                        continue
+                    # 多图：倒数第二段是 weibo_id；单图：最后一段就是 weibo_id
+                    if len(parts) >= 3:
+                        weibo_id = parts[-2]
+                    else:
+                        weibo_id = parts[-1]
+                    if not weibo_id.isdigit():
+                        continue
+                    index.setdefault(weibo_id, []).append(p)
+            except Exception:
+                continue
+
+        # 确保每个微博ID下的图片按文件名排序，避免顺序抖动
+        for wid, paths in index.items():
+            paths.sort(key=lambda x: x.name)
+            index[wid] = paths
+
+        return index
+
     @staticmethod
     def _parse_comment_time(raw: str) -> Optional[datetime]:
         """
@@ -412,6 +482,12 @@ class WeiboPdfExporter:
         # timeline starts from page 2
         elements.append(PageBreak())
 
+        # 在 PDF 输出目录附近预构建一份「微博ID -> 图片文件列表」索引，
+        # 这样每条微博可以快速找到自己的本地图片并插入到正文下方。
+        search_root = output_path.parent
+        image_index = self._build_image_index(search_root)
+        max_width = A4[0] - 40 * mm  # 页面宽度减去左右边距
+
         for post in weibos:
             header = f"{post.created_at.strftime('%Y-%m-%d %H:%M:%S')}  微博ID: {post.id}"
             elements.append(Paragraph(escape(header), styles["weibo_header"]))
@@ -422,6 +498,22 @@ class WeiboPdfExporter:
                     Paragraph(escape(post.text).replace("\n", "<br/>"), styles["weibo"])
                 )
                 elements.append(Spacer(1, 2 * mm))
+
+            # 如果本地有与该微博ID对应的图片文件，则将图片插入到正文下方
+            img_paths = image_index.get(post.id) or []
+            for img_path in img_paths:
+                try:
+                    img = RLImage(str(img_path))
+                    # 超宽图片按页面宽度等比缩放
+                    if img.drawWidth > max_width:
+                        factor = float(max_width) / float(img.drawWidth or max_width)
+                        img.drawWidth = max_width
+                        img.drawHeight = img.drawHeight * factor
+                    elements.append(img)
+                    elements.append(Spacer(1, 2 * mm))
+                except Exception:
+                    # 单张图片出问题时忽略，继续生成其它内容
+                    continue
 
             if post.comments:
                 elements.append(Paragraph("评论：", styles["comment_header"]))
