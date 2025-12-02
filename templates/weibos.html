@@ -32,13 +32,25 @@
 </table>
 {% if total_pages and total_pages > 1 %}
   <p>
-    第 {{ page }} / {{ total_pages }} 页
+    第
+    <form method="get" action="{{ url_for('get_weibos') }}" style="display:inline;">
+      <input type="number"
+             name="page"
+             value="{{ page }}"
+             min="1"
+             max="{{ total_pages }}"
+             style="width:48px; text-align:center;" />
+      <button type="submit">跳转</button>
+    </form>
+    / {{ total_pages }} 页
     {% if page > 1 %}
       | <a href="{{ url_for('get_weibos', page=page-1) }}">上一页</a>
     {% endif %}
     {% if page < total_pages %}
       | <a href="{{ url_for('get_weibos', page=page+1) }}">下一页</a>
     {% endif %}
+    | <a href="{{ url_for('get_weibos', page=1) }}">首页</a>
+    | <a href="{{ url_for('get_weibos', page=total_pages) }}">末页</a>
   </p>
 {% endif %}
 {% endblock %}
