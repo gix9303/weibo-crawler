@@ -2013,9 +2013,18 @@ class Weibo(object):
     def export_comments_to_csv_for_current_user(self):
         """将当前用户相关的评论从 SQLite 导出到该用户目录下的 CSV 文件"""
         # 仅在启用了 sqlite 写入且开启下载评论时导出
+        # 且本次任务对于该用户实际抓取到了微博数据（got_count > 0），
+        # 避免在“本次未获取到任何微博”的情况下生成看起来有数据的结果文件。
         if "sqlite" not in self.write_mode or not self.download_comment:
             return
         try:
+            if getattr(self, "got_count", 0) <= 0:
+                user_id = str(self.user_config.get("user_id", ""))
+                logger.info(
+                    "用户 %s 本次任务未获取到微博数据，跳过评论 CSV 导出", user_id
+                )
+                return
+
             # 导出前检查一次是否需要停止
             if self.stop_checker:
                 self.stop_checker()
@@ -2565,9 +2574,11 @@ class Weibo(object):
                 self.export_comments_to_csv_for_current_user()
 
                 # 在 CSV 写入 weibo 目录后，继续导出当前用户的 PDF 到 weibo 目录
-                # PDF 内容基于 SQLite 中的用户与微博+评论数据
+                # PDF 内容基于 SQLite 中的用户与微博+评论数据。
+                # 若本次任务未获取到任何微博（got_count == 0），则不生成 PDF 文件，
+                # 避免在“无新数据”的子任务目录下出现看起来有内容的 PDF。
                 try:
-                    if "sqlite" in self.write_mode:
+                    if "sqlite" in self.write_mode and getattr(self, "got_count", 0) > 0:
                         db_path = Path(self.get_sqlte_path())
                         pdf_exporter = WeiboPdfExporter(db_path=db_path)
 
