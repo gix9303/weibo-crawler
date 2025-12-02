@@ -166,6 +166,37 @@ def _init_tasks_table():
 _init_tasks_table()
 
 
+def _cleanup_stale_tasks_on_boot():
+    """
+    服务启动时清理上一次异常退出遗留的“运行中”任务状态：
+    - 对所有 state 为 PENDING/PROGRESS 的任务，统一标记为 FAILED，
+      并将 command 置为 FINISHED，避免页面误认为仍有任务在运行。
+    - 实际上当前实现并不支持任务自动恢复，因此这些任务本质上已经中断。
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tasks
+            SET state = 'FAILED',
+                command = 'FINISHED',
+                error = COALESCE(error, '服务重启前任务已中断，状态自动标记为失败')
+            WHERE state IN ('PENDING', 'PROGRESS')
+            """
+        )
+        affected = cur.rowcount if hasattr(cur, "rowcount") else None
+        conn.commit()
+        if affected:
+            logger.info("服务启动时已将 %s 条遗留的 PENDING/PROGRESS 任务标记为 FAILED", affected)
+    except Exception as e:
+        logger.warning("启动时清理遗留任务状态失败: %s", e)
+    finally:
+        if conn:
+            conn.close()
+
+
 class TaskStopped(Exception):
     """用户请求停止当前任务时抛出的异常，用于优雅退出。"""
     pass
@@ -2399,7 +2430,9 @@ def get_weibo_detail(weibo_id):
 
 
 if __name__ == "__main__":
-    # 服务启动时，根据 config.json 自动决定是否恢复定时任务
+    # 服务启动时，先清理上一次异常退出遗留的“运行中”任务状态，
+    # 再根据 config.json 自动决定是否恢复定时任务。
+    _cleanup_stale_tasks_on_boot()
     _auto_start_scheduler_on_boot()
     logger.info("服务启动，提供 Web 管理界面，如已配置定时任务将自动恢复调度")
     # 启动Flask应用
