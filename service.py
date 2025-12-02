@@ -419,6 +419,45 @@ def _get_task_latest_end_date(task: dict) -> datetime | None:
     return latest
 
 
+def _get_task_weibo_count(task: dict) -> int | None:
+    """
+    尝试从任务的 result 字段中解析本次任务抓取到的微博数量。
+    - run_refresh_task 在成功时会将 result 写成 JSON:
+      {"message": "...", "weibo_count": 123}
+    - 旧任务的 result 可能是普通字符串，此时返回 None（视为未知）。
+    """
+    val = task.get("result")
+    if not val:
+        return None
+    try:
+        if isinstance(val, dict):
+            data = val
+        else:
+            data = json.loads(str(val))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if "weibo_count" not in data:
+        return None
+    try:
+        return int(data.get("weibo_count") or 0)
+    except Exception:
+        return None
+
+
+def _task_has_weibo_data(task: dict) -> bool:
+    """
+    根据 result 中记录的 weibo_count 判断本次任务是否实际抓取到微博数据。
+    - weibo_count > 0 视为有数据
+    - 解析失败或老任务（无 weibo_count）默认视为有数据，保持兼容
+    """
+    count = _get_task_weibo_count(task)
+    if count is None:
+        return True
+    return count > 0
+
+
 def _resolve_user_names_for_notification(config: dict) -> str:
     """
     根据 config 中的 user_id_list，从 SQLite user 表解析出用户昵称列表。
@@ -741,24 +780,28 @@ def run_refresh_task(task_id, user_id_list=None):
         except Exception as cfg_err:
             logger.warning("更新 config.json 中 end_date 失败: %s", cfg_err)
 
+        # 统计本次任务实际抓取到的微博数量，用于后续判断是否允许下载
+        try:
+            got_count = int(getattr(wb, "got_count", 0) or 0)
+        except Exception:
+            got_count = 0
+
         db_update_task(
             task_id,
             progress=100,
             state="SUCCESS",
-            result="微博列表已刷新",
+            result={
+                "message": "微博列表已刷新",
+                "weibo_count": got_count,
+            },
             command="FINISHED",
         )
 
-        # 任务成功完成后发送 PushDeer 通知
+        # 任务成功完成后发送 PushDeer 通知：仅在实际抓取到微博数据时发送
         try:
             if config and const.NOTIFY.get("NOTIFY"):
                 name_str = _resolve_user_names_for_notification(config) or "未知用户"
-                # 如果有实际抓取到微博数据才发送成功通知
-                try:
-                    got_count = getattr(wb, "got_count", 0)
-                except Exception:
-                    got_count = 0
-                if got_count and got_count > 0:
+                if got_count > 0:
                     push_deer(f"微博爬虫任务 {task_id} 已完成，用户：{name_str}")
         except Exception as notify_err:
             logger.warning("发送 PushDeer 成功通知失败: %s", notify_err)
@@ -1121,12 +1164,14 @@ def download_task_weibo(task_id):
             )
         return jsonify(data), 404
 
-    if task.get("state") != "SUCCESS":
-        msg = f"任务当前状态为 {task.get('state')}，仅在 SUCCESS 状态下才可下载 weibo 目录内容"
+    state = task.get("state")
+    # 任务未成功时，禁止下载
+    if state != "SUCCESS":
+        msg = f"任务当前状态为 {state}，仅在 SUCCESS 状态下才可下载爬取结果"
         if wants_html():
             response = {
                 "task_id": task_id,
-                "state": task.get("state"),
+                "state": state,
                 "progress": task.get("progress"),
                 "created_at": task.get("created_at"),
                 "user_id_list": task.get("user_id_list"),
@@ -1138,7 +1183,7 @@ def download_task_weibo(task_id):
                     task_id=task_id,
                     task_title="任务详情(无法下载结果)",
                     response=response,
-                    state=task.get("state"),
+                    state=state,
                     is_parent=False,
                     is_child=False,
                     parent_task_id=None,
@@ -1153,7 +1198,47 @@ def download_task_weibo(task_id):
                 ),
                 400,
             )
-        return jsonify({"error": msg, "state": task.get("state")}), 400
+        return jsonify({"error": msg, "state": state}), 400
+
+    # 若本次任务实际未抓取到任何微博数据，也不允许下载
+    if not _task_has_weibo_data(task):
+        msg = "本次任务未获取到任何微博数据，暂无可下载结果"
+        if wants_html():
+            response = {
+                "task_id": task_id,
+                "state": state,
+                "progress": task.get("progress"),
+                "created_at": task.get("created_at"),
+                "user_id_list": task.get("user_id_list"),
+                "message": msg,
+            }
+            return (
+                render_template(
+                    "task_detail.html",
+                    task_id=task_id,
+                    task_title="任务详情(暂无可下载数据)",
+                    response=response,
+                    state=state,
+                    is_parent=False,
+                    is_child=False,
+                    parent_task_id=None,
+                    child_tasks=[],
+                    has_running_child=False,
+                    can_download_weibo_dir=False,
+                    can_stop=False,
+                    stop_disabled=True,
+                    notice_html="",
+                    prev_task_id=None,
+                    next_task_id=None,
+                ),
+                400,
+            )
+        return jsonify(
+            {
+                "error": msg,
+                "state": state,
+            }
+        ), 400
 
     base_dir = os.path.split(os.path.realpath(__file__))[0]
     weibo_root = os.path.join(base_dir, "weibo")
@@ -1744,11 +1829,13 @@ def get_task_status(task_id):
                         }
                     )
         # 下载当前任务 weibo 目录内容：
-        # - SUCCESS 且未过期：正常可点
+        # - SUCCESS 且有数据且未过期：正常可点
+        # - SUCCESS 但本次任务未获取到微博：灰色提示，按钮不可点
         # - SUCCESS 且超过7天：灰色提示，按钮不可点
         # - PENDING/PROGRESS：灰色提示，按钮不可点
         state = task.get('state')
-        can_download_weibo_dir = state == 'SUCCESS'
+        has_weibo_data = _task_has_weibo_data(task) if state == 'SUCCESS' else True
+        can_download_weibo_dir = (state == 'SUCCESS') and has_weibo_data
         download_expired = False
         if state == 'SUCCESS':
             try:

@@ -46,6 +46,8 @@
     <p><a href="/task/{{ task_id }}/download">点击下载爬取的数据</a></p>
   {% elif state in ['PENDING', 'PROGRESS'] %}
     <p><span style="color: gray;">点击下载爬取的数据（任务未完成，暂不可下载）</span></p>
+  {% elif state == 'SUCCESS' and not can_download_weibo_dir %}
+    <p><span style="color: gray;">点击下载爬取的数据（本次任务未获取到任何微博，暂无可下载数据）</span></p>
   {% elif download_expired %}
     <p><span style="color: gray;">点击下载爬取的数据（超过7天，已删除）</span></p>
   {% endif %}
