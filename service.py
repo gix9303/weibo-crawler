@@ -1713,7 +1713,7 @@ def get_task_status(task_id):
 
         # 计算上一条 / 下一条任务（按 created_at 倒序排列），
         # 但根据任务类型控制跳转范围：
-        # - 子任务：仅在同一个父任务（同一 schedule_id 或该父任务本身）范围内跳转
+        # - 子任务：仅在所属父任务的“子任务列表”中跳转（同一 schedule_id，且不包含父任务本身）
         # - 父任务和普通任务：仅在“非子任务”（schedule_id 为空或 schedule_id == task_id）之间跳转
         prev_task_id = None
         next_task_id = None
@@ -1723,14 +1723,15 @@ def get_task_status(task_id):
             cur = conn.cursor()
 
             if is_child and schedule_id:
-                # 子任务：在所属父任务的任务组内（父任务 + 该父任务的所有子任务）跳转
+                # 子任务：只在所属父任务的子任务集合内跳转（不包含父任务本身）
                 parent_id = str(schedule_id)
                 # 上一条（组内，created_at 更晚）
                 cur.execute(
                     """
                     SELECT task_id FROM tasks
                     WHERE created_at > ?
-                      AND (task_id = ? OR schedule_id = ?)
+                      AND schedule_id = ?
+                      AND task_id != ?
                     ORDER BY created_at ASC
                     LIMIT 1
                     """,
@@ -1744,7 +1745,8 @@ def get_task_status(task_id):
                     """
                     SELECT task_id FROM tasks
                     WHERE created_at < ?
-                      AND (task_id = ? OR schedule_id = ?)
+                      AND schedule_id = ?
+                      AND task_id != ?
                     ORDER BY created_at DESC
                     LIMIT 1
                     """,
