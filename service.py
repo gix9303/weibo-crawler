@@ -21,7 +21,12 @@ import uuid
 import time
 from datetime import datetime, timedelta
 from html import escape
+from pathlib import Path
+import tempfile
+import shutil
+import csv
 from util.notify import push_deer
+from util.pdf_exporter import WeiboPdfExporter
 import re
 
 # 1896820725 天津股侠 2024-12-09T16:47:04
@@ -1229,9 +1234,6 @@ def download_task_weibo(task_id):
     zip_name = f"{safe_nick}_{start_str}_{end_str}_{task_prefix}.zip"
 
     # 将该任务的 weibo 目录打包为 zip 并返回
-    import tempfile
-    import shutil
-
     tmp_dir = tempfile.gettempdir()
     archive_base = os.path.join(tmp_dir, f"weibo_{task_id}")
     try:
@@ -1362,11 +1364,6 @@ def download_schedule_results():
             )
         return jsonify(data), 404
 
-    import tempfile
-    import shutil
-    from pathlib import Path
-    from util.pdf_exporter import WeiboPdfExporter
-
     # 临时目录，用于聚合导出
     tmp_root = tempfile.mkdtemp(prefix=f"schedule_{schedule_id}_")
     agg_root = os.path.join(tmp_root, "aggregated")
@@ -1387,7 +1384,26 @@ def download_schedule_results():
             )
         return jsonify(data), 500
 
-    # 为每个用户导出聚合微博 / 评论 CSV 和 PDF
+    # 为每个用户导出聚合微博 / 评论 CSV 和 PDF，并汇总图片/视频到该用户目录
+    weibo_root = os.path.join(base_dir, "weibo")
+    task_ids: list[str] = []
+    try:
+        cur.execute(
+            """
+            SELECT task_id
+            FROM tasks
+            WHERE schedule_id = ?
+            """,
+            (schedule_id,),
+        )
+        task_rows = cur.fetchall() or []
+        for row in task_rows:
+            tid = str(row[0]) if row and row[0] else ""
+            if tid:
+                task_ids.append(tid)
+    except Exception as e:
+        logger.warning("查询定时任务 %s 的任务ID列表失败: %s", schedule_id, e)
+
     exported_any = False
     try:
         for uid in sorted(user_ids):
@@ -1430,7 +1446,6 @@ def download_schedule_results():
             if weibo_rows:
                 weibo_csv_path = os.path.join(user_dir, f"{safe_nick}_weibos_all.csv")
                 headers = list(weibo_rows[0].keys())
-                import csv
 
                 with open(weibo_csv_path, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f)
@@ -1465,7 +1480,6 @@ def download_schedule_results():
             if comment_rows:
                 comments_csv_path = os.path.join(user_dir, f"{safe_nick}_comments_all.csv")
                 headers = list(comment_rows[0].keys())
-                import csv
 
                 with open(comments_csv_path, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f)
@@ -1477,13 +1491,71 @@ def download_schedule_results():
             try:
                 db_path = Path(DATABASE_PATH)
                 pdf_exporter = WeiboPdfExporter(db_path=db_path)
-                pdf_path = pdf_exporter.export_user_timeline(
+                pdf_exporter.export_user_timeline(
                     user_id=str(uid),
                     output_path=os.path.join(user_dir, f"{safe_nick}_all.pdf"),
                 )
-                logger.info("为用户 %s 导出聚合 PDF: %s", uid, pdf_path)
             except Exception as e:
                 logger.warning("为用户 %s 导出聚合 PDF 失败: %s", uid, e)
+
+            # 汇总该用户在各个任务中的图片/视频到 <用户目录>/img、video、live_photo 下
+            try:
+                img_dst = os.path.join(user_dir, "img")
+                video_dst = os.path.join(user_dir, "video")
+                live_dst = os.path.join(user_dir, "live_photo")
+                os.makedirs(img_dst, exist_ok=True)
+                os.makedirs(video_dst, exist_ok=True)
+                os.makedirs(live_dst, exist_ok=True)
+
+                for tid in task_ids:
+                    task_base = os.path.join(weibo_root, tid)
+                    if not os.path.isdir(task_base):
+                        continue
+
+                    user_src_dir = None
+                    try:
+                        for sub in os.listdir(task_base):
+                            cand = os.path.join(task_base, sub)
+                            if not os.path.isdir(cand):
+                                continue
+                            csv_candidate = os.path.join(cand, f"{uid}.csv")
+                            if os.path.isfile(csv_candidate):
+                                user_src_dir = cand
+                                break
+                    except Exception as scan_err:
+                        logger.warning("扫描任务 %s 下的用户目录失败: %s", tid, scan_err)
+                        continue
+
+                    if not user_src_dir:
+                        continue
+
+                    for src_type, dst_root in [
+                        ("img", img_dst),
+                        ("video", video_dst),
+                        ("live_photo", live_dst),
+                    ]:
+                        src_dir = os.path.join(user_src_dir, src_type)
+                        if not os.path.isdir(src_dir):
+                            continue
+                        try:
+                            for name in os.listdir(src_dir):
+                                src_file = os.path.join(src_dir, name)
+                                if not os.path.isfile(src_file):
+                                    continue
+                                dst_file = os.path.join(dst_root, name)
+                                if os.path.isfile(dst_file):
+                                    continue
+                                shutil.copy2(src_file, dst_file)
+                        except Exception as copy_err:
+                            logger.warning(
+                                "复制任务 %s 用户 %s 的 %s 文件失败: %s",
+                                tid,
+                                uid,
+                                src_type,
+                                copy_err,
+                            )
+            except Exception as e:
+                logger.warning("汇总用户 %s 图片/视频文件失败: %s", uid, e)
 
             exported_any = exported_any or bool(weibo_rows or comment_rows)
     finally:
@@ -1778,8 +1850,6 @@ def list_tasks():
                     conn.commit()
                     # 同时删除 weibo 目录下对应的任务结果目录 weibo/<task_id>/
                     try:
-                        import shutil
-
                         base_dir = os.path.split(os.path.realpath(__file__))[0]
                         task_weibo_dir = os.path.join(base_dir, "weibo", str(task_id))
                         if os.path.isdir(task_weibo_dir):
@@ -1836,8 +1906,6 @@ def list_tasks():
                 task_weibo_dir = os.path.join(base_dir, "weibo", str(task_id))
                 if os.path.isdir(task_weibo_dir):
                     try:
-                        import shutil
-
                         shutil.rmtree(task_weibo_dir, ignore_errors=True)
                         logger.info(
                             "任务 %s 的 weibo 目录因超过7天自动删除: %s",
