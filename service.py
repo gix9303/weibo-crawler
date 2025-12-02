@@ -386,13 +386,43 @@ def _extract_user_ids_from_config(config: dict) -> list[str]:
 
 def _get_task_latest_end_date(task: dict) -> datetime | None:
     """
-    从任务的 user_id_list 中解析出最新的 end_date（若存在）。
-    end_date 可能是 'YYYY-MM-DD' 或 'YYYY-MM-DDTHH:MM:SS' 形式。
+    解析任务的“最近结束时间”：
+    优先使用 result 中记录的 latest_end_date（若存在），
+    否则回退到 task.user_id_list 中的 end_date。
+
+    时间字符串支持：
+    - 'YYYY-MM-DDTHH:MM:SS'（优先）
+    - 'YYYY-MM-DD'（回退）
     """
+    # 1) 优先从 result JSON 中读取 latest_end_date（新逻辑）
+    latest: datetime | None = None
+    try:
+        raw_result = task.get("result")
+        if raw_result:
+            if isinstance(raw_result, dict):
+                result_obj = raw_result
+            else:
+                result_obj = json.loads(str(raw_result))
+            if isinstance(result_obj, dict):
+                s = str(result_obj.get("latest_end_date") or "").strip()
+                if s:
+                    try:
+                        latest = datetime.fromisoformat(s)
+                    except Exception:
+                        try:
+                            latest = datetime.strptime(s, "%Y-%m-%d")
+                        except Exception:
+                            latest = None
+                    if latest:
+                        return latest
+    except Exception:
+        # result 字段解析失败时，回退到旧逻辑，不阻断整体流程
+        latest = None
+
+    # 2) 回退：从 user_id_list 中解析 end_date（旧任务或旧结构）
     ul = task.get("user_id_list")
     if not isinstance(ul, list):
         return None
-    latest: datetime | None = None
     for entry in ul:
         if not isinstance(entry, dict):
             continue
@@ -780,11 +810,35 @@ def run_refresh_task(task_id, user_id_list=None):
         except Exception as cfg_err:
             logger.warning("更新 config.json 中 end_date 失败: %s", cfg_err)
 
-        # 统计本次任务实际抓取到的微博数量，用于后续判断是否允许下载
+        # 统计本次任务实际抓取到的微博数量 和 本次任务的最新结束时间，
+        # 用于后续判断是否允许下载以及 7 天自动过期逻辑。
         try:
             got_count = int(getattr(wb, "got_count", 0) or 0)
         except Exception:
             got_count = 0
+        latest_end_dt: datetime | None = None
+        try:
+            for u_cfg in getattr(wb, "user_config_list", []) or []:
+                end_token = u_cfg.get("end_date")
+                if not end_token:
+                    continue
+                s = str(end_token).strip()
+                if not s:
+                    continue
+                dt_val: datetime | None = None
+                try:
+                    dt_val = datetime.fromisoformat(s)
+                except Exception:
+                    try:
+                        dt_val = datetime.strptime(s, "%Y-%m-%d")
+                    except Exception:
+                        dt_val = None
+                if not dt_val:
+                    continue
+                if latest_end_dt is None or dt_val > latest_end_dt:
+                    latest_end_dt = dt_val
+        except Exception as _end_err:
+            logger.warning("统计任务 %s 的 latest_end_date 失败: %s", task_id, _end_err)
 
         db_update_task(
             task_id,
@@ -793,6 +847,7 @@ def run_refresh_task(task_id, user_id_list=None):
             result={
                 "message": "微博列表已刷新",
                 "weibo_count": got_count,
+                "latest_end_date": latest_end_dt.isoformat() if latest_end_dt else None,
             },
             command="FINISHED",
         )
@@ -1985,6 +2040,10 @@ def list_tasks():
         t_state = t.get("state")
         t_command = t.get("command") or ""
         t["download_expired"] = False
+        # 仅对已成功完成的任务执行“7天过期”逻辑，运行中/失败任务不做自动清理，
+        # 以避免刚启动的新任务因为历史 end_date 配置被误判为已过期。
+        if t_state != "SUCCESS":
+            continue
         try:
             end_dt = _get_task_latest_end_date(t)
             if not end_dt:
