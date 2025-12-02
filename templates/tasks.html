@@ -79,17 +79,17 @@
 
 {% if total_pages and total_pages > 1 %}
   <p>
-    第
     <form method="get" action="{{ url_for('list_tasks') }}" style="display:inline;">
+      第
       <input type="number"
              name="page"
              value="{{ page }}"
              min="1"
              max="{{ total_pages }}"
              style="width:48px; text-align:center;" />
+      / {{ total_pages }} 页
       <button type="submit">跳转</button>
     </form>
-    / {{ total_pages }} 页
     {% if page > 1 %}
       | <a href="{{ url_for('list_tasks', page=page-1) }}">上一页</a>
     {% endif %}
