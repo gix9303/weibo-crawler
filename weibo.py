@@ -35,6 +35,10 @@ from util.pdf_exporter import WeiboPdfExporter  # 导出 PDF 所需
 
 warnings.filterwarnings("ignore")
 
+# 全局标记：本次进程中是否已经发送过一次“Cookie / 登录状态可能失效”的提醒，
+# 避免在接口连续失败时重复推送大量通知。
+COOKIE_WARNING_SENT = False
+
 # 如果日志文件夹不存在，则创建；exist_ok=True 避免多进程并发创建时报错
 if not os.path.isdir("log/"):
     os.makedirs("log/", exist_ok=True)
@@ -367,6 +371,24 @@ class Weibo(object):
         """设置停止检查回调，签名为 callback()，如需停止可在内部抛出异常。"""
         self.stop_checker = callback
 
+    def _notify_possible_cookie_invalid(self, reason: str):
+        """
+        当检测到接口连续失败、需要验证码或 ok!=1 等异常情况时，
+        发送一次 PushDeer 通知，提示用户检查或更新 Cookie。
+        """
+        global COOKIE_WARNING_SENT
+        if COOKIE_WARNING_SENT:
+            return
+        COOKIE_WARNING_SENT = True
+
+        msg = f"微博爬虫接口异常，可能是 Cookie 已失效或需要验证码，请在配置页更新 Cookie。\n原因：{reason}"
+        logger.warning(msg)
+        try:
+            if const.NOTIFY.get("NOTIFY"):
+                push_deer(msg)
+        except Exception as e:
+            logger.warning("发送 Cookie 异常提醒失败: %s", e)
+
     def get_json(self, params):
         url = "https://m.weibo.cn/api/container/getIndex?"
         try:
@@ -459,6 +481,10 @@ class Weibo(object):
                     page,
                     js.get("ok"),
                 )
+                # 提前提醒一次：接口已返回异常，可能是 Cookie / 登录状态问题
+                self._notify_possible_cookie_invalid(
+                    f"page={page}, ok={js.get('ok')}, 无有效 data 字段"
+                )
                 if self.handle_captcha(js):
                     logger.info("用户已完成验证码验证，继续请求数据。")
                     retries = 0  # 重置重试计数器
@@ -483,6 +509,10 @@ class Weibo(object):
                     self.stop_checker()
                 sleep(sleep_time)
         logger.error("超过最大重试次数，跳过当前页面。")
+        # 多次重试均失败，触发一次 Cookie/登录异常提醒
+        self._notify_possible_cookie_invalid(
+            f"page={page}, 连续 {max_retries} 次请求或解析失败"
+        )
         return {}
     
     def user_to_csv(self):
