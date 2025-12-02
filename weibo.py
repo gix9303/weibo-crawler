@@ -442,26 +442,30 @@ class Weibo(object):
             if self.stop_checker:
                 self.stop_checker()
             try:
-                response = self.session.get(url, params=params, headers=self.headers, timeout=10)
+                response = self.session.get(
+                    url, params=params, headers=self.headers, timeout=10
+                )
                 response.raise_for_status()  # 如果响应状态码不是 200，会抛出 HTTPError
                 js = response.json()
-                if 'data' in js:
-                    #此处逻辑 与外部取值相同
-                    if 'card_group' in js["data"]["cards"][0]:
-                        logger.info(f"成功获取到页面 {page} 的数据。")
-                        return js
-                    else:
-                        logger.warning(f"页面 {page} 中没有微博数据，可能设置了显示时间限制.")
-                        return {"ok": False}
+
+                # 正常情况：ok=1 且包含 data 字段，交给上层 get_one_page 按 query / 非 query 逻辑解析
+                if js.get("ok") == 1 and "data" in js:
+                    logger.info(f"成功获取到页面 {page} 的数据。")
+                    return js
+
+                # 可能是需要验证码或其他错误场景，尝试走验证码处理逻辑
+                logger.warning(
+                    "未能获取到有效微博数据，可能需要验证码验证或受到展示限制（page=%s, ok=%s）",
+                    page,
+                    js.get("ok"),
+                )
+                if self.handle_captcha(js):
+                    logger.info("用户已完成验证码验证，继续请求数据。")
+                    retries = 0  # 重置重试计数器
+                    continue
                 else:
-                    logger.warning("未能获取到数据，可能需要验证码验证。")
-                    if self.handle_captcha(js):
-                        logger.info("用户已完成验证码验证，继续请求数据。")
-                        retries = 0  # 重置重试计数器
-                        continue
-                    else:
-                        logger.error("验证码验证失败或未完成，程序将退出。")
-                        sys.exit()
+                    logger.error("验证码验证失败或未完成，程序将退出。")
+                    sys.exit()
             except RequestException as e:
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
