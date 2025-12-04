@@ -527,6 +527,24 @@ mongodb_URI是mongodb的连接字符串。如果你不需要将结果信息写�
 
 post_config是write_mode为post时请求的配置，包括API URL和Token。如果你不需要将结果通过post发出，write_mode不包含post，这个参数可以忽略，即删除或保留都无所谓；如果你需要通过post发出，则需要改成自己的目标API URL和api_token。
 
+**设置pdf（按年拆分 PDF，可选）**
+
+`service.py` 会在每个用户抓取完成后生成一份时间线 PDF，默认包含该用户所有抓取到的微博和评论。可以通过 `config.json` 中的 `pdf` 段控制是否“按年拆分”：
+
+```json
+"pdf": {
+  "split_by_year": true
+}
+```
+
+- `split_by_year = false`（默认）：只生成一份 PDF（按时间从新到旧）；
+- `split_by_year = true`：如果时间跨度跨多年，将为每一年生成一份 PDF（文件名中会带起止日期）。
+
+该开关同时作用于：
+
+- 单次任务结束时为每个用户生成的 PDF；
+- 定时任务父任务聚合下载中为每个用户生成的 `<昵称>_all*.pdf`。
+
 
 **设置start_page（可选）**
 
@@ -964,10 +982,28 @@ services:
 
 注：本方法也将会抓取提供cookie账号的微博内容。
 
-在间歇运行程序时，cookie无效会导致程序不能按照预设目标执行，因此可以打开cookie通知功能。本项目使用开源项目[pushdeer](https://github.com/easychen/pushdeer)进行通知，在使用前用户需要申请push_key，具体可查看官网了解。打开方法为：
+在间歇运行程序时，cookie无效会导致程序不能按照预设目标执行，因此可以打开通知功能。本项目使用开源项目 [PushDeer](https://github.com/easychen/pushdeer) 进行推送，在使用前用户需要申请 `push_key`（可参考 PushDeer 官方说明）。
 
-1. 在`const.py`文件中，将`'NOTIFY': False`中的`False`设为`True`；
-2. 将`'PUSH_KEY': ''`的`''`替换为`'<你的push_key>'`
+现在的通知能力包括：
+
+- Cookie 异常：接口多次失败或微博返回 `ok != 1` 时，提示“Cookie 可能已失效或需要验证码，请更新配置”；
+- 任务状态：任务成功/失败/被手动停止时推送简要说明；
+- 定时聚合：父任务聚合 ZIP 长时间未生成、下载端点重试 3 次仍无结果时，提醒“聚合结果尚未生成，暂不可下载”。
+
+开启方式有两种：
+
+1. 通过 Web 配置页  
+   - 在“其他配置 -> PushDeer 通知”中勾选“启用 PushDeer 通知”；  
+   - 在下方输入框填入你的 `push_key`；  
+   - 点击“仅保存配置”或“保存配置并启动任务”。
+
+2. 直接编辑 `config.json`  
+   ```json
+   "notify": {
+     "enable": true,
+     "push_key": "your_pushdeer_key"
+   }
+   ```
 
 ## API 服务与 Web 管理界面
 
@@ -984,7 +1020,7 @@ python service.py
 - 在线编辑 `config.json`（用户列表、时间区间、cookie、通知、定时任务开关）；
 - 启动一次性任务或「保存配置并启动」定时任务；
 - 在「任务列表」「当前状态」查看进度、停止任务；
-- 在任务详情页下载本次爬取的数据。任务 `end_date` 超过 7 天后，对应 `weibo/<task_id>/` 会自动清理，列表和详情页会以灰色提示「下载超过7天，已经删除」。
+- 在任务详情页下载本次爬取的数据。任务 `end_date` 超过 7 天后，对应 `weibo/<task_id>/` 会自动清理，列表和详情页会以灰色提示「下载超过7天，已经删除」。对于定时任务父任务，下载的是按用户聚合后的 ZIP，子任务间隙后台会预生成聚合结果；若聚合尚未完成，按钮会灰色提示「正在准备聚合结果，暂不可下载」。
 
 - HTTP API
 
