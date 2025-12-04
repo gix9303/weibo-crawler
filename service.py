@@ -862,6 +862,26 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
         # 用覆盖方式更新缓存 zip
         shutil.move(zip_path, dest_zip_path)
         logger.info("已预生成定时任务 %s 的聚合结果缓存: %s", schedule_id, dest_zip_path)
+        # 聚合结果就绪时发送 PushDeer 通知，提示用户“现在可以下载”
+        try:
+            if const.NOTIFY.get("NOTIFY"):
+                # 尝试解析当前配置中的用户昵称列表，构造更友好的提示
+                try:
+                    cfg = load_config_from_file()
+                except SystemExit:
+                    cfg = {}
+                except Exception:
+                    cfg = {}
+                name_str = ""
+                if isinstance(cfg, dict):
+                    name_str = _resolve_user_names_for_notification(cfg) or ""
+                if name_str:
+                    msg = f"定时任务 {schedule_id} 的聚合结果已生成，可下载用户：{name_str}"
+                else:
+                    msg = f"定时任务 {schedule_id} 的聚合结果已生成，可下载"
+                push_deer(msg)
+        except Exception as notify_err:
+            logger.warning("发送定时任务 %s 聚合结果就绪通知失败: %s", schedule_id, notify_err)
     except Exception as e:
         logger.warning("移动定时任务 %s 聚合结果到缓存路径失败: %s", schedule_id, e)
     finally:
