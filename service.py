@@ -35,6 +35,7 @@ import re
 BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
 DATABASE_PATH = os.path.join(BASE_DIR, "weibo", "weibodata.db")
 SCHEDULE_CACHE_ROOT = os.path.join(BASE_DIR, "weibo", "_schedule_cache")
+TASK_CACHE_ROOT = os.path.join(BASE_DIR, "weibo", "_task_cache")
 
 # 如果日志文件夹不存在，则创建；exist_ok=True 避免多进程并发创建时报错
 if not os.path.isdir("log/"):
@@ -538,6 +539,16 @@ def _get_schedule_cache_zip_path(schedule_id: str) -> str:
     return os.path.join(SCHEDULE_CACHE_ROOT, f"schedule_results_{safe_id}.zip")
 
 
+def _get_task_cache_zip_path(task_id: str) -> str:
+    """
+    返回单个任务 weibo 目录 zip 的缓存路径：
+    weibo/_task_cache/task_<task_id>.zip
+    """
+    os.makedirs(TASK_CACHE_ROOT, exist_ok=True)
+    safe_id = str(task_id)
+    return os.path.join(TASK_CACHE_ROOT, f"task_{safe_id}.zip")
+
+
 def _schedule_has_running_tasks(schedule_id: str) -> bool:
     """
     判断某个定时任务（父任务 + 子任务）下是否仍有运行中的任务。
@@ -855,6 +866,57 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
         logger.warning("移动定时任务 %s 聚合结果到缓存路径失败: %s", schedule_id, e)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _build_task_weibo_zip_cache(task: dict) -> None:
+    """
+    为单个任务预先打包其 weibo/<task_id>/ 目录为 zip 缓存：
+    - 仅使用该任务自己的 weibo 目录，不做跨任务聚合；
+    - 若目录不存在或为空，则直接跳过。
+    """
+    task_id = str(task.get("task_id") or "").strip()
+    if not task_id:
+        return
+
+    base_dir = os.path.split(os.path.realpath(__file__))[0]
+    weibo_root = os.path.join(base_dir, "weibo")
+    task_weibo_dir = os.path.join(weibo_root, task_id)
+    if not os.path.isdir(task_weibo_dir):
+        logger.info("任务 %s 没有 weibo 结果目录 %s，跳过单任务 zip 预生成", task_id, task_weibo_dir)
+        return
+
+    # 简单检查目录内是否有内容，避免为空目录生成 zip
+    try:
+        has_files = False
+        for _root, _dirs, files in os.walk(task_weibo_dir):
+            if files:
+                has_files = True
+                break
+        if not has_files:
+            logger.info("任务 %s 的 weibo 目录为空，跳过单任务 zip 预生成", task_id)
+            return
+    except Exception as e:
+        logger.warning("扫描任务 %s 的 weibo 目录失败，跳过单任务 zip 预生成: %s", task_id, e)
+        return
+
+    cache_zip_path = _get_task_cache_zip_path(task_id)
+
+    # 在临时目录下创建 zip，完成后再移动到缓存路径（覆盖旧缓存）
+    tmp_dir = tempfile.gettempdir()
+    archive_base = os.path.join(tmp_dir, f"weibo_task_{task_id}")
+    try:
+        zip_path = shutil.make_archive(archive_base, "zip", task_weibo_dir)
+    except Exception as e:
+        logger.warning("预生成任务 %s 的单任务 zip 失败: %s", task_id, e)
+        return
+
+    try:
+        os.makedirs(os.path.dirname(cache_zip_path), exist_ok=True)
+        shutil.move(zip_path, cache_zip_path)
+        logger.info("已预生成任务 %s 的单任务 zip 缓存: %s", task_id, cache_zip_path)
+    except Exception as e:
+        logger.warning("移动任务 %s 单任务 zip 到缓存路径失败: %s", task_id, e)
+        # 失败时临时 zip 由调用者或系统清理
 
 
 def _prebuild_schedule_results_if_needed(task: dict) -> None:
@@ -1262,14 +1324,20 @@ def run_refresh_task(task_id, user_id_list=None):
             command="FINISHED",
         )
 
-        # 如果当前任务属于某个定时任务，则在任务完成后尝试预生成该定时任务的聚合 zip，
-        # 避免用户点击父任务下载时再等待长时间的聚合过程。
+        # 任务成功完成后：
+        # 1）若属于某个定时任务，则尝试预生成该定时任务的聚合 zip；
+        # 2）同时为当前任务预先打包单任务 weibo 目录为 zip（普通任务和子任务均适用），
+        #    避免用户点击下载时再现场打包。
         try:
             fresh_task = db_get_task(task_id)
             if fresh_task:
+                # 定时任务的父/子任务：预生成聚合 zip
                 _prebuild_schedule_results_if_needed(fresh_task)
+                # 所有成功任务（普通任务 + 父/子任务）：预生成各自的单任务 zip
+                if _task_has_weibo_data(fresh_task):
+                    _build_task_weibo_zip_cache(fresh_task)
         except Exception as pre_err:
-            logger.warning("任务 %s 完成后预生成定时聚合结果失败: %s", task_id, pre_err)
+            logger.warning("任务 %s 完成后预生成下载缓存失败: %s", task_id, pre_err)
 
         # 任务成功完成后发送 PushDeer 通知：仅在实际抓取到微博数据时发送
         try:
@@ -1819,20 +1887,37 @@ def download_task_weibo(task_id):
     task_prefix = str(task_id)[:5]
     zip_name = f"{safe_nick}_{start_str}_{end_str}_{task_prefix}.zip"
 
-    # 将该任务的 weibo 目录打包为 zip 并返回
-    tmp_dir = tempfile.gettempdir()
-    archive_base = os.path.join(tmp_dir, f"weibo_{task_id}")
-    try:
-        zip_path = shutil.make_archive(archive_base, "zip", task_weibo_dir)
-    except Exception as e:
-        logger.exception("打包 weibo 目录失败: %s", e)
-        data = {"error": f"打包 weibo 目录失败: {e}"}
-        if wants_html():
-            return (
-                render_template("schedule_error.html", error=data["error"]),
-                500,
-            )
-        return jsonify(data), 500
+    # 优先使用预先生成的单任务 zip 缓存；若不存在，则现场打包一次并写入缓存
+    cache_zip_path = _get_task_cache_zip_path(task_id)
+    zip_path = None
+    if os.path.isfile(cache_zip_path):
+        zip_path = cache_zip_path
+    else:
+        tmp_dir = tempfile.gettempdir()
+        archive_base = os.path.join(tmp_dir, f"weibo_{task_id}")
+        try:
+            zip_path = shutil.make_archive(archive_base, "zip", task_weibo_dir)
+            # 打包成功后，将 zip 移动到缓存路径，供后续重复使用
+            try:
+                os.makedirs(os.path.dirname(cache_zip_path), exist_ok=True)
+                shutil.move(zip_path, cache_zip_path)
+                zip_path = cache_zip_path
+                logger.info("已为任务 %s 现场生成并缓存单任务 zip: %s", task_id, cache_zip_path)
+            except Exception as move_err:
+                logger.warning(
+                    "任务 %s 现场生成 zip 成功，但移动到缓存路径失败，将直接返回临时 zip: %s",
+                    task_id,
+                    move_err,
+                )
+        except Exception as e:
+            logger.exception("打包 weibo 目录失败: %s", e)
+            data = {"error": f"打包 weibo 目录失败: {e}"}
+            if wants_html():
+                return (
+                    render_template("schedule_error.html", error=data["error"]),
+                    500,
+                )
+            return jsonify(data), 500
 
     return send_file(
         zip_path,
