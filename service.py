@@ -1495,15 +1495,42 @@ def refresh():
         with task_lock:
             logger.info("refresh POST: acquiring task_lock to start task")
             task_id = str(uuid.uuid4())
-            # 若启用了定时任务，则将当前任务视为父任务：schedule_id = 本次 task_id
+
+            # 若启用了定时任务：
+            # - 若 config.json 中已有 schedule.schedule_id，则视为“复用原父任务”，
+            #   本次任务作为该父任务的子任务：schedule_id = 既有父任务ID；
+            # - 若尚未设置 schedule.schedule_id，则本次任务视为新的父任务：
+            #   schedule_id = 本次 task_id，并将其写回 config.json。
             schedule_cfg = cfg.get("schedule") or {}
             schedule_enable_val = bool(schedule_cfg.get("enable")) if isinstance(schedule_cfg, dict) else False
-            schedule_id = task_id if schedule_enable_val else None
+
+            parent_schedule_id: str | None = None
+            if schedule_enable_val and isinstance(schedule_cfg, dict):
+                existing_parent = str(schedule_cfg.get("schedule_id") or "").strip()
+                if existing_parent:
+                    parent_schedule_id = existing_parent
+
+            if schedule_enable_val:
+                if parent_schedule_id:
+                    # 复用原父任务：本次作为子任务挂在既有父任务ID之下
+                    schedule_id = parent_schedule_id
+                    logger.info(
+                        "refresh POST: 定时任务已存在父任务 %s，本次任务 %s 将作为子任务挂载其下",
+                        parent_schedule_id,
+                        task_id,
+                    )
+                else:
+                    # 第一次启用定时任务：当前任务即为父任务
+                    schedule_id = task_id
+                    parent_schedule_id = task_id
+            else:
+                schedule_id = None
+
             db_create_task(task_id, user_id_list, schedule_id=schedule_id)
             current_task_id = task_id
 
-            # 如果启用定时任务，则将父任务的 task_id 写入 config.json 的 schedule.schedule_id
-            if schedule_enable_val:
+            # 若本次启用了定时任务，且是“首次创建父任务”的场景，则将父任务ID写回 config.json
+            if schedule_enable_val and parent_schedule_id == task_id:
                 try:
                     with open(config_path, "r", encoding="utf-8") as f:
                         latest_cfg = json.load(f)
