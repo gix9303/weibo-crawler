@@ -55,12 +55,14 @@
 
 {# 父任务：下载整个定时任务聚合后的爬取数据 #}
 {% if is_parent %}
-  {% if state in ['PENDING', 'PROGRESS'] or has_running_child %}
-    <p><span style="color: gray;">点击下载爬取的数据（存在运行中的任务，暂不可下载）</span></p>
-  {% elif download_expired %}
+  {% if download_expired %}
     <p><span style="color: gray;">点击下载爬取的数据（超过7天，已删除）</span></p>
-  {% else %}
+  {% elif has_schedule_zip %}
     <p><a href="/schedule/download?schedule_id={{ task_id }}">点击下载爬取的数据</a></p>
+  {% elif state in ['PENDING', 'PROGRESS'] or has_running_child %}
+    <p><span style="color: gray;">点击下载爬取的数据（存在运行中的任务，暂不可下载）</span></p>
+  {% else %}
+    <p><span style="color: gray;">点击下载爬取的数据（正在准备聚合结果，暂不可下载）</span></p>
   {% endif %}
 {% endif %}
 

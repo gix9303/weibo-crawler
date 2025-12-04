@@ -34,6 +34,7 @@ import re
 # 始终以当前脚本所在目录为基准存放 SQLite 文件，避免工作目录变化导致路径错误
 BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
 DATABASE_PATH = os.path.join(BASE_DIR, "weibo", "weibodata.db")
+SCHEDULE_CACHE_ROOT = os.path.join(BASE_DIR, "weibo", "_schedule_cache")
 
 # 如果日志文件夹不存在，则创建；exist_ok=True 避免多进程并发创建时报错
 if not os.path.isdir("log/"):
@@ -527,6 +528,368 @@ def _task_has_weibo_data(task: dict) -> bool:
     return count > 0
 
 
+def _get_schedule_cache_zip_path(schedule_id: str) -> str:
+    """
+    返回某个定时任务聚合结果 zip 的固定缓存路径：
+    weibo/_schedule_cache/schedule_results_<schedule_id>.zip
+    """
+    os.makedirs(SCHEDULE_CACHE_ROOT, exist_ok=True)
+    safe_id = str(schedule_id)
+    return os.path.join(SCHEDULE_CACHE_ROOT, f"schedule_results_{safe_id}.zip")
+
+
+def _schedule_has_running_tasks(schedule_id: str) -> bool:
+    """
+    判断某个定时任务（父任务 + 子任务）下是否仍有运行中的任务。
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(1)
+            FROM tasks
+            WHERE (schedule_id = ? OR task_id = ?)
+              AND state IN ('PENDING', 'PROGRESS')
+            """,
+            (schedule_id, schedule_id),
+        )
+        row = cur.fetchone()
+        return bool(row and row[0])
+    except Exception as e:
+        logger.warning("检测定时任务 %s 是否有运行中子任务失败: %s", schedule_id, e)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def _build_schedule_results_cache(schedule_id: str) -> None:
+    """
+    构建/刷新某个定时任务的聚合结果缓存：
+    - 从 SQLite 中拉取该 schedule 下所有任务的数据
+    - 为每个用户导出聚合微博/评论 CSV 和 PDF
+    - 汇总所有子任务的图片/视频
+    - 最后生成一个稳定路径的 zip：weibo/_schedule_cache/schedule_results_<schedule_id>.zip
+    """
+    base_dir = os.path.split(os.path.realpath(__file__))[0]
+    weibo_root = os.path.join(base_dir, "weibo")
+    dest_zip_path = _get_schedule_cache_zip_path(schedule_id)
+
+    # 1) 聚合该 schedule 下的所有任务的 user_id_list，形成用户 ID 集合
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT user_id_list
+            FROM tasks
+            WHERE schedule_id = ?
+            """,
+            (schedule_id,),
+        )
+        rows = cur.fetchall()
+        user_ids: set[str] = set()
+        for r in rows:
+            raw = r[0]
+            if not raw:
+                continue
+            try:
+                ul = json.loads(raw)
+            except Exception:
+                ul = raw
+            if isinstance(ul, list):
+                for item in ul:
+                    if isinstance(item, dict):
+                        uid = item.get("user_id") or item.get("id")
+                    else:
+                        uid = item
+                    if uid:
+                        user_ids.add(str(uid).strip())
+            else:
+                s = str(ul).strip()
+                if s:
+                    user_ids.add(s)
+    except Exception as e:
+        logger.warning("预生成定时任务 %s 聚合结果时查询任务列表失败: %s", schedule_id, e)
+        if conn:
+            conn.close()
+        return
+    finally:
+        if conn:
+            conn = None
+
+    if not user_ids:
+        logger.info("定时任务 %s 下未找到任何用户信息，跳过聚合结果预生成", schedule_id)
+        # 若之前存在旧缓存，可选择删除；这里保留不动。
+        return
+
+    # 2) 临时目录，用于本次聚合导出
+    tmp_root = tempfile.mkdtemp(prefix=f"schedule_{schedule_id}_")
+    agg_root = os.path.join(tmp_root, "aggregated")
+    os.makedirs(agg_root, exist_ok=True)
+
+    # 3) 打开 SQLite 连接，后续查询用
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+    except Exception as e:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        logger.warning("预生成定时任务 %s 聚合结果时打开 SQLite 失败: %s", schedule_id, e)
+        return
+
+    # 4) 查询该 schedule 下所有任务 ID，用于汇总图片/视频
+    task_ids: list[str] = []
+    try:
+        cur.execute(
+            """
+            SELECT task_id
+            FROM tasks
+            WHERE schedule_id = ?
+            """,
+            (schedule_id,),
+        )
+        task_rows = cur.fetchall() or []
+        for row in task_rows:
+            tid = str(row[0]) if row and row[0] else ""
+            if tid:
+                task_ids.append(tid)
+    except Exception as e:
+        logger.warning("预生成定时任务 %s 聚合结果时查询任务ID列表失败: %s", schedule_id, e)
+
+    # 5) 为每个用户导出聚合微博 / 评论 CSV 和 PDF，并汇总图片/视频到该用户目录
+    exported_any = False
+    try:
+        for uid in sorted(user_ids):
+            if not uid:
+                continue
+
+            # 查询昵称
+            nick = uid
+            try:
+                cur.execute("SELECT nick_name FROM user WHERE id = ?", (uid,))
+                row = cur.fetchone()
+                if row and row["nick_name"]:
+                    nick = row["nick_name"]
+            except Exception:
+                pass
+            safe_nick = re.sub(r'[\\/:*?"<>|]', "_", str(nick))
+
+            user_dir = os.path.join(agg_root, safe_nick)
+            os.makedirs(user_dir, exist_ok=True)
+
+            # 导出所有微博
+            try:
+                cur.execute(
+                    """
+                    SELECT id, bid, user_id, screen_name, text, article_url,
+                           topics, at_users, pics, video_url, live_photo_url,
+                           location, created_at, source,
+                           attitudes_count, comments_count, reposts_count, retweet_id
+                    FROM weibo
+                    WHERE user_id = ?
+                    ORDER BY datetime(created_at) ASC, id ASC
+                    """,
+                    (uid,),
+                )
+                weibo_rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("预生成定时任务 %s 时导出用户 %s 微博失败: %s", schedule_id, uid, e)
+                weibo_rows = []
+
+            if weibo_rows:
+                weibo_csv_path = os.path.join(user_dir, f"{safe_nick}_weibos_all.csv")
+                headers = list(weibo_rows[0].keys())
+
+                with open(weibo_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    for r in weibo_rows:
+                        writer.writerow([r[h] for h in headers])
+
+            # 导出评论
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        c.id,
+                        c.weibo_id,
+                        c.created_at,
+                        c.user_screen_name,
+                        c.text,
+                        c.pic_url,
+                        c.like_count
+                    FROM comments c
+                    JOIN weibo w ON c.weibo_id = w.id
+                    WHERE w.user_id = ?
+                    ORDER BY datetime(c.created_at) ASC, c.id ASC
+                    """,
+                    (uid,),
+                )
+                comment_rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("预生成定时任务 %s 时导出用户 %s 评论失败: %s", schedule_id, uid, e)
+                comment_rows = []
+
+            if comment_rows:
+                comments_csv_path = os.path.join(user_dir, f"{safe_nick}_comments_all.csv")
+                headers = list(comment_rows[0].keys())
+
+                with open(comments_csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    for r in comment_rows:
+                        writer.writerow([r[h] for h in headers])
+
+            # 导出 PDF（聚合所有微博+评论）
+            try:
+                db_path = Path(DATABASE_PATH)
+                pdf_exporter = WeiboPdfExporter(db_path=db_path)
+                pdf_exporter.export_user_timeline(
+                    user_id=str(uid),
+                    output_path=os.path.join(user_dir, f"{safe_nick}_all.pdf"),
+                )
+            except Exception as e:
+                logger.warning("预生成定时任务 %s 时为用户 %s 导出聚合 PDF 失败: %s", schedule_id, uid, e)
+
+            # 汇总该用户在各个任务中的图片/视频到 <用户目录>/img、video、live_photo 下
+            try:
+                img_dst = os.path.join(user_dir, "img")
+                video_dst = os.path.join(user_dir, "video")
+                live_dst = os.path.join(user_dir, "live_photo")
+                os.makedirs(img_dst, exist_ok=True)
+                os.makedirs(video_dst, exist_ok=True)
+                os.makedirs(live_dst, exist_ok=True)
+
+                for tid in task_ids:
+                    task_base = os.path.join(weibo_root, tid)
+                    if not os.path.isdir(task_base):
+                        continue
+
+                    user_src_dir = None
+                    try:
+                        for sub in os.listdir(task_base):
+                            cand = os.path.join(task_base, sub)
+                            if not os.path.isdir(cand):
+                                continue
+                            csv_candidate = os.path.join(cand, f"{uid}.csv")
+                            if os.path.isfile(csv_candidate):
+                                user_src_dir = cand
+                                break
+                    except Exception as scan_err:
+                        logger.warning(
+                            "预生成定时任务 %s 时扫描任务 %s 下的用户目录失败: %s",
+                            schedule_id,
+                            tid,
+                            scan_err,
+                        )
+                        continue
+
+                    if not user_src_dir:
+                        continue
+
+                    for src_type, dst_root in [
+                        ("img", img_dst),
+                        ("video", video_dst),
+                        ("live_photo", live_dst),
+                    ]:
+                        src_dir = os.path.join(user_src_dir, src_type)
+                        if not os.path.isdir(src_dir):
+                            continue
+                        try:
+                            for name in os.listdir(src_dir):
+                                src_file = os.path.join(src_dir, name)
+                                if not os.path.isfile(src_file):
+                                    continue
+                                dst_file = os.path.join(dst_root, name)
+                                if os.path.isfile(dst_file):
+                                    continue
+                                shutil.copy2(src_file, dst_file)
+                        except Exception as copy_err:
+                            logger.warning(
+                                "预生成定时任务 %s 时复制任务 %s 用户 %s 的 %s 文件失败: %s",
+                                schedule_id,
+                                tid,
+                                uid,
+                                src_type,
+                                copy_err,
+                            )
+            except Exception as e:
+                logger.warning(
+                    "预生成定时任务 %s 时汇总用户 %s 图片/视频文件失败: %s",
+                    schedule_id,
+                    uid,
+                    e,
+                )
+
+            exported_any = exported_any or bool(weibo_rows or comment_rows)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not exported_any:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        logger.info("定时任务 %s 下没有可导出的微博或评论数据，跳过聚合结果预生成", schedule_id)
+        return
+
+    # 6) 打包为 zip，并移动到固定缓存路径
+    zip_base = os.path.join(tmp_root, f"schedule_{schedule_id}_aggregated")
+    try:
+        zip_path = shutil.make_archive(zip_base, "zip", agg_root)
+    except Exception as e:
+        logger.exception("预生成定时任务 %s 聚合结果时打包失败: %s", schedule_id, e)
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        return
+
+    try:
+        os.makedirs(os.path.dirname(dest_zip_path), exist_ok=True)
+        # 用覆盖方式更新缓存 zip
+        shutil.move(zip_path, dest_zip_path)
+        logger.info("已预生成定时任务 %s 的聚合结果缓存: %s", schedule_id, dest_zip_path)
+    except Exception as e:
+        logger.warning("移动定时任务 %s 聚合结果到缓存路径失败: %s", schedule_id, e)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _prebuild_schedule_results_if_needed(task: dict) -> None:
+    """
+    在子任务/父任务执行完毕后，根据任务信息决定是否预构建定时任务的聚合 zip：
+    - 仅当该任务属于某个定时任务（schedule_id 非空）时处理；
+    - 仅当本次任务实际抓取到微博数据（weibo_count > 0）时才重新聚合；
+    - 若该定时任务下仍存在运行中的任务，则跳过本轮预生成；
+    """
+    schedule_id = task.get("schedule_id")
+    if not schedule_id:
+        return
+
+    # 本次任务没有抓到微博数据，保留之前的聚合结果，不必重新聚合
+    if not _task_has_weibo_data(task):
+        logger.info(
+            "任务 %s 属于定时任务 %s，但本次未获取到微博数据，跳过聚合结果预生成",
+            task.get("task_id"),
+            schedule_id,
+        )
+        return
+
+    # 若该定时任务下仍有运行中的任务，则暂不预生成，等待下一次任务完成后再做
+    if _schedule_has_running_tasks(schedule_id):
+        logger.info(
+            "定时任务 %s 仍有运行中的任务，暂不预生成聚合结果", schedule_id
+        )
+        return
+
+    try:
+        _build_schedule_results_cache(schedule_id)
+    except Exception as e:
+        logger.warning("预生成定时任务 %s 聚合结果异常: %s", schedule_id, e)
+
+
 def _resolve_user_names_for_notification(config: dict) -> str:
     """
     根据 config 中的 user_id_list，从 SQLite user 表解析出用户昵称列表。
@@ -890,6 +1253,15 @@ def run_refresh_task(task_id, user_id_list=None):
             },
             command="FINISHED",
         )
+
+        # 如果当前任务属于某个定时任务，则在任务完成后尝试预生成该定时任务的聚合 zip，
+        # 避免用户点击父任务下载时再等待长时间的聚合过程。
+        try:
+            fresh_task = db_get_task(task_id)
+            if fresh_task:
+                _prebuild_schedule_results_if_needed(fresh_task)
+        except Exception as pre_err:
+            logger.warning("任务 %s 完成后预生成定时聚合结果失败: %s", task_id, pre_err)
 
         # 任务成功完成后发送 PushDeer 通知：仅在实际抓取到微博数据时发送
         try:
@@ -1468,7 +1840,19 @@ def download_schedule_results():
         if not schedule_id:
             raise ValueError("未找到任何带有 schedule_id 的任务")
 
-        # 若该定时任务中仍有运行中的任务（父任务或其子任务），则拒绝下载
+        # 若缓存 zip 已存在，则直接返回缓存结果，避免每次点击都重新聚合；
+        # 即使此时有新的子任务正在运行，也允许用户下载上一份已完成的聚合结果。
+        cache_zip_path = _get_schedule_cache_zip_path(schedule_id)
+        if os.path.isfile(cache_zip_path):
+            download_name = f"schedule_results_{schedule_id}.zip"
+            return send_file(
+                cache_zip_path,
+                as_attachment=True,
+                download_name=download_name,
+                mimetype="application/zip",
+            )
+
+        # 缓存不存在时，才检查是否允许现算：若仍有运行中的任务，则拒绝下载
         cur.execute(
             """
             SELECT COUNT(1)
@@ -1534,14 +1918,47 @@ def download_schedule_results():
         if conn:
             conn = None  # 真正的关闭操作在后面新的 conn 使用中处理
 
-    if not user_ids:
-        data = {"error": f"定时任务 {schedule_id} 下未找到任何用户信息"}
-        if wants_html():
-            return (
-                render_template("schedule_error.html", error=data["error"]),
-                404,
+    # --- 仅使用缓存 zip，不在下载请求中现算聚合结果 ---
+    cache_zip_path = _get_schedule_cache_zip_path(schedule_id)
+    if os.path.isfile(cache_zip_path):
+        download_name = f"schedule_results_{schedule_id}.zip"
+        return send_file(
+            cache_zip_path,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype="application/zip",
+        )
+
+    # 缓存尚不存在：在本次下载请求中最多重试 3 次等待聚合结果生成（每次等待 2 秒），
+    # 若仍未生成，则返回错误，并通过 PushDeer 提醒用户。
+    max_checks = 3
+    wait_seconds = 2
+    for _ in range(max_checks):
+        time.sleep(wait_seconds)
+        if os.path.isfile(cache_zip_path):
+            download_name = f"schedule_results_{schedule_id}.zip"
+            return send_file(
+                cache_zip_path,
+                as_attachment=True,
+                download_name=download_name,
+                mimetype="application/zip",
             )
-        return jsonify(data), 404
+
+    msg = f"定时任务 {schedule_id} 的聚合结果尚未生成，正在准备中，暂不可下载，请稍后重试。"
+    logger.warning(msg)
+    try:
+        if const.NOTIFY.get("NOTIFY"):
+            push_deer(msg)
+    except Exception as notify_err:
+        logger.warning("发送定时任务聚合结果准备中提醒失败: %s", notify_err)
+
+    data = {"error": msg}
+    if wants_html():
+        return (
+            render_template("schedule_error.html", error=data["error"]),
+            503,
+        )
+    return jsonify(data), 503
 
     # 临时目录，用于聚合导出
     tmp_root = tempfile.mkdtemp(prefix=f"schedule_{schedule_id}_")
@@ -1767,9 +2184,23 @@ def download_schedule_results():
             )
         return jsonify(data), 500
 
-    # 不立即删除 zip 文件，让 send_file 可以访问；临时目录稍后由系统回收
+    # 不立即删除 zip 文件，让 send_file 可以访问；临时目录稍后由系统回收。
+    # 同时将本次生成的 zip 更新到缓存路径，便于后续快速下载。
+    final_zip_path = _get_schedule_cache_zip_path(schedule_id)
+    try:
+        os.makedirs(os.path.dirname(final_zip_path), exist_ok=True)
+        shutil.move(zip_path, final_zip_path)
+    except Exception as mv_err:
+        logger.warning("移动定时任务 %s 的 zip 到缓存路径失败: %s", schedule_id, mv_err)
+        final_zip_path = zip_path
+
     download_name = f"schedule_results_{schedule_id}.zip"
-    return send_file(zip_path, as_attachment=True, download_name=download_name, mimetype="application/zip")
+    return send_file(
+        final_zip_path,
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="application/zip",
+    )
 
 @app.route('/task/<task_id>', methods=['GET'])
 def get_task_status(task_id):
@@ -1804,6 +2235,7 @@ def get_task_status(task_id):
         is_child = bool(schedule_id and str(schedule_id) != task_id)
         parent_task_id = str(schedule_id) if is_child else None
         has_running_child = False
+        has_schedule_zip = False
 
         # 计算上一条 / 下一条任务（按 created_at 倒序排列），
         # 但根据任务类型控制跳转范围：
@@ -1924,6 +2356,12 @@ def get_task_status(task_id):
                             "created_at": str(ccreated),
                         }
                     )
+            # 计算当前父任务是否已经有预生成的聚合 zip，可用于控制下载按钮是否可用
+            try:
+                cache_zip_path = _get_schedule_cache_zip_path(task_id)
+                has_schedule_zip = os.path.isfile(cache_zip_path)
+            except Exception:
+                has_schedule_zip = False
         # 下载当前任务 weibo 目录内容：
         # - SUCCESS 且有数据且未过期：正常可点
         # - SUCCESS 但本次任务未获取到微博：灰色提示，按钮不可点
@@ -1992,6 +2430,7 @@ def get_task_status(task_id):
             notice_html=notice_html,
             prev_task_id=prev_task_id,
             next_task_id=next_task_id,
+            has_schedule_zip=has_schedule_zip,
         )
 
     return jsonify(response)
