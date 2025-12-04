@@ -724,34 +724,70 @@ class Weibo(object):
                     user_info["id"] = self.user_config["user_id"]
                     user_info["screen_name"] = info.get("screen_name", "")
                     user_info["gender"] = info.get("gender", "")
-                    params = {
-                        "containerid": "230283" + str(self.user_config["user_id"]) + "_-_INFO"
-                    }
-                    zh_list = ["生日", "所在地", "IP属地", "小学", "初中", "高中", "大学", "公司", "注册时间", "阳光信用"]
-                    en_list = [
-                        "birthday",
-                        "location",
-                        "ip_location",
-                        "education",
-                        "education",
-                        "education",
-                        "education",
-                        "company",
-                        "registration_time",
-                        "sunshine",
-                    ]
-                    for i in en_list:
-                        user_info[i] = ""
-                    js, _ = self.get_json(params)
-                    if js["ok"]:
-                        cards = js["data"]["cards"]
-                        if isinstance(cards, list) and len(cards) > 1:
-                            card_list = cards[0]["card_group"] + cards[1]["card_group"]
-                            for card in card_list:
-                                if card.get("item_name") in zh_list:
-                                    user_info[
-                                        en_list[zh_list.index(card.get("item_name"))]
-                                    ] = card.get("item_content", "")
+                    # 继续请求“用户信息”详情页（生日、所在地、注册时间等），
+                    # 若接口结构异常（如无 data/cards），仅记录 warning，避免抛出 KeyError 终止整个任务。
+                    try:
+                        params = {
+                            "containerid": "230283"
+                            + str(self.user_config["user_id"])
+                            + "_-_INFO"
+                        }
+                        zh_list = [
+                            "生日",
+                            "所在地",
+                            "IP属地",
+                            "小学",
+                            "初中",
+                            "高中",
+                            "大学",
+                            "公司",
+                            "注册时间",
+                            "阳光信用",
+                        ]
+                        en_list = [
+                            "birthday",
+                            "location",
+                            "ip_location",
+                            "education",
+                            "education",
+                            "education",
+                            "education",
+                            "company",
+                            "registration_time",
+                            "sunshine",
+                        ]
+                        for key in en_list:
+                            user_info[key] = ""
+
+                        js_detail, _ = self.get_json(params)
+                        if (
+                            js_detail
+                            and js_detail.get("ok")
+                            and isinstance(js_detail.get("data"), dict)
+                        ):
+                            cards = js_detail["data"].get("cards") or []
+                            if isinstance(cards, list) and len(cards) > 1:
+                                card_list = (
+                                    cards[0].get("card_group", [])
+                                    + cards[1].get("card_group", [])
+                                )
+                                for card in card_list:
+                                    item_name = card.get("item_name")
+                                    if item_name in zh_list:
+                                        idx = zh_list.index(item_name)
+                                        key = en_list[idx]
+                                        user_info[key] = card.get("item_content", "")
+                        else:
+                            logger.warning(
+                                "获取用户 %s 的详细信息结构异常（无 data/cards），将跳过生日/所在地等字段。",
+                                self.user_config["user_id"],
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "获取用户 %s 的详细信息失败（将跳过生日/所在地等字段）: %s",
+                            self.user_config["user_id"],
+                            e,
+                        )
                     user_info["statuses_count"] = self.string_to_int(
                         info.get("statuses_count", 0)
                     )
