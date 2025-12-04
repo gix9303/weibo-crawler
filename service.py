@@ -197,6 +197,11 @@ def _cleanup_stale_tasks_on_boot():
             conn.close()
 
 
+# 在模块加载时即执行一次遗留任务状态清理，确保无论以 python 直接运行，
+# 还是通过 gunicorn 等 WSGI 容器加载，都能在进程启动时修正旧的 PENDING/PROGRESS 状态。
+_cleanup_stale_tasks_on_boot()
+
+
 class TaskStopped(Exception):
     """用户请求停止当前任务时抛出的异常，用于优雅退出。"""
     pass
@@ -351,7 +356,9 @@ def get_running_task():
                 """
                 SELECT task_id, state, progress, created_at, user_id_list, command, error, result, schedule_id
                 FROM tasks
-                WHERE task_id = ? AND state IN ('PENDING', 'PROGRESS')
+                WHERE task_id = ?
+                  AND state IN ('PENDING', 'PROGRESS')
+                  AND command = 'RUNNING'
                 """,
                 (cid,),
             )
@@ -366,6 +373,7 @@ def get_running_task():
             SELECT task_id, state, progress, created_at, user_id_list, command, error, result, schedule_id
             FROM tasks
             WHERE state IN ('PENDING', 'PROGRESS')
+              AND command = 'RUNNING'
             ORDER BY created_at DESC
             LIMIT 1
             """
