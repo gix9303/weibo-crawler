@@ -861,26 +861,34 @@ def _prebuild_schedule_results_if_needed(task: dict) -> None:
     """
     在子任务/父任务执行完毕后，根据任务信息决定是否预构建定时任务的聚合 zip：
     - 仅当该任务属于某个定时任务（schedule_id 非空）时处理；
-    - 仅当本次任务实际抓取到微博数据（weibo_count > 0）时才重新聚合；
     - 若该定时任务下仍存在运行中的任务，则跳过本轮预生成；
+    - 新逻辑：每次任务结束后都检查缓存 zip 是否存在：
+      * 若 zip 已存在且本次任务未获取到微博数据，则保留原缓存，跳过预生成；
+      * 若 zip 不存在，或者本次任务实际抓取到微博数据，则执行预聚合，
+        通过 SQLite 汇总该定时任务下“所有已有数据”（包括历史子任务）。
     """
     schedule_id = task.get("schedule_id")
     if not schedule_id:
-        return
-
-    # 本次任务没有抓到微博数据，保留之前的聚合结果，不必重新聚合
-    if not _task_has_weibo_data(task):
-        logger.info(
-            "任务 %s 属于定时任务 %s，但本次未获取到微博数据，跳过聚合结果预生成",
-            task.get("task_id"),
-            schedule_id,
-        )
         return
 
     # 若该定时任务下仍有运行中的任务，则暂不预生成，等待下一次任务完成后再做
     if _schedule_has_running_tasks(schedule_id):
         logger.info(
             "定时任务 %s 仍有运行中的任务，暂不预生成聚合结果", schedule_id
+        )
+        return
+
+    # 计算当前定时任务的缓存 zip 路径
+    cache_zip_path = _get_schedule_cache_zip_path(str(schedule_id))
+    cache_exists = os.path.isfile(cache_zip_path)
+
+    # 若本次任务没有抓到微博数据，且缓存 zip 已存在，则直接复用旧缓存
+    if (not _task_has_weibo_data(task)) and cache_exists:
+        logger.info(
+            "任务 %s 属于定时任务 %s，本次未获取到微博数据，且已存在聚合结果缓存 %s，跳过本轮预生成",
+            task.get("task_id"),
+            schedule_id,
+            cache_zip_path,
         )
         return
 
