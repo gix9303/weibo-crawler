@@ -430,7 +430,11 @@ class WeiboPdfExporter:
         if not raw:
             return None
         try:
-            return datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y")
+            # 解析为带时区的 datetime，然后去掉 tzinfo，统一使用“naive” 时间，
+            # 避免在排序时与 datetime.min（naive）比较出现
+            # "can't compare offset-naive and offset-aware datetimes" 错误。
+            dt = datetime.strptime(raw, "%a %b %d %H:%M:%S %z %Y")
+            return dt.replace(tzinfo=None)
         except Exception:
             return None
 
