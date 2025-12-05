@@ -1,6 +1,8 @@
 # Weibo Crawler
 
 - [Weibo Crawler](#weibo-crawler)
+  - [快速开始](#快速开始)
+  - [下载与缓存说明](#下载与缓存说明)
   - [功能](#功能)
   - [输出](#输出)
   - [实例](#实例)
@@ -19,6 +21,40 @@
   - [如何获取cookie（可选）](#如何获取cookie可选)
   - [如何检测cookie是否有效（可选）](#如何检测cookie是否有效可选)
   - [API服务](#api服务)
+
+本仓库基于 dataabc/weibo-crawler，新增 Flask Web 管理界面、定时任务调度与聚合下载，以及 Docker 部署栈。
+
+## 快速开始
+
+### Web 管理界面（推荐）
+
+```bash
+python service.py
+```
+
+在浏览器打开 `http://127.0.0.1:5000/`，可在线编辑 `config.json`、启动一次性或定时任务、查看进度并下载任务结果。接口定义见 `API.md`。
+
+### Docker 部署
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+以 gunicorn + nginx 运行；记得通过 `-v` 挂载 `config.json`、`weibo/` 输出目录，以及可选的 `user_id_list.txt`。
+
+### 传统命令行
+
+```bash
+python weibo.py
+```
+
+直接读取根目录 `config.json` 运行爬虫，可配合 `const.py` 调整 append/全量模式。快速语法检查可执行 `python -m py_compile service.py weibo.py`。
+
+## 下载与缓存说明
+
+- 单次任务下载（`/task/<id>/download`）只会打包 `weibo/<task_id>/`，任务 `end_date` 超过 7 天后对应目录会被清理，详情页会提示不可下载。
+- 定时任务聚合下载（`/schedule/download`）仅读取 `weibo/_schedule_cache/schedule_results_<schedule_id>.zip`。聚合 ZIP 在子任务/父任务结束后后台生成；若缓存未就绪，接口会短暂轮询后返回「正在准备聚合结果」，不会在请求内重新聚合。
 
 ## 功能
 
