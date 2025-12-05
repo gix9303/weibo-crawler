@@ -788,14 +788,17 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
             except Exception as e:
                 logger.warning("预生成定时任务 %s 时为用户 %s 导出聚合 PDF 失败: %s", schedule_id, uid, e)
 
-            # 汇总该用户在各个任务中的图片/视频到 <用户目录>/img、video、live_photo 下
+            # 汇总该用户在各个任务中的图片/视频到 <用户目录>/img、video、live_photo 下，
+            # 同时汇总评论图片到 <用户目录>/comments_img 下。
             try:
                 img_dst = os.path.join(user_dir, "img")
                 video_dst = os.path.join(user_dir, "video")
                 live_dst = os.path.join(user_dir, "live_photo")
+                comments_img_dst = os.path.join(user_dir, "comments_img")
                 os.makedirs(img_dst, exist_ok=True)
                 os.makedirs(video_dst, exist_ok=True)
                 os.makedirs(live_dst, exist_ok=True)
+                os.makedirs(comments_img_dst, exist_ok=True)
 
                 for tid in task_ids:
                     task_base = os.path.join(weibo_root, tid)
@@ -824,6 +827,7 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
                     if not user_src_dir:
                         continue
 
+                    # 1）微博正文中的图片/视频/Live Photo
                     for src_type, dst_root in [
                         ("img", img_dst),
                         ("video", video_dst),
@@ -832,15 +836,19 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
                         src_dir = os.path.join(user_src_dir, src_type)
                         if not os.path.isdir(src_dir):
                             continue
+                        # 递归遍历 src_dir 下的所有文件（例如 img/原创微博图片/*、img/转发微博图片/*），
+                        # 并扁平化复制到聚合目录下的 img/、video/、live_photo/ 根目录中。
                         try:
-                            for name in os.listdir(src_dir):
-                                src_file = os.path.join(src_dir, name)
-                                if not os.path.isfile(src_file):
-                                    continue
-                                dst_file = os.path.join(dst_root, name)
-                                if os.path.isfile(dst_file):
-                                    continue
-                                shutil.copy2(src_file, dst_file)
+                            for root, _dirs, files in os.walk(src_dir):
+                                for name in files:
+                                    src_file = os.path.join(root, name)
+                                    if not os.path.isfile(src_file):
+                                        continue
+                                    dst_file = os.path.join(dst_root, name)
+                                    if os.path.isfile(dst_file):
+                                        # 已存在同名文件则跳过，避免重复复制
+                                        continue
+                                    shutil.copy2(src_file, dst_file)
                         except Exception as copy_err:
                             logger.warning(
                                 "预生成定时任务 %s 时复制任务 %s 用户 %s 的 %s 文件失败: %s",
@@ -848,6 +856,34 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
                                 tid,
                                 uid,
                                 src_type,
+                                    copy_err,
+                            )
+
+                    # 2）评论中的配图：
+                    #    - 旧版路径：weibo/<task_id>/<用户目录>/<safe_nick>_comments_img/*
+                    #    - 新版路径：weibo/<task_id>/<用户目录>/comments_img/*
+                    for comments_img_src in [
+                        os.path.join(user_src_dir, "comments_img"),
+                        os.path.join(user_src_dir, f"{safe_nick}_comments_img"),
+                    ]:
+                        if not os.path.isdir(comments_img_src):
+                            continue
+                        try:
+                            for root, _dirs, files in os.walk(comments_img_src):
+                                for name in files:
+                                    src_file = os.path.join(root, name)
+                                    if not os.path.isfile(src_file):
+                                        continue
+                                    dst_file = os.path.join(comments_img_dst, name)
+                                    if os.path.isfile(dst_file):
+                                        continue
+                                    shutil.copy2(src_file, dst_file)
+                        except Exception as copy_err:
+                            logger.warning(
+                                "预生成定时任务 %s 时复制任务 %s 用户 %s 的评论图片失败: %s",
+                                schedule_id,
+                                tid,
+                                uid,
                                 copy_err,
                             )
             except Exception as e:

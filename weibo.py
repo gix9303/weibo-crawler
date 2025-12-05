@@ -2337,7 +2337,7 @@ class Weibo(object):
         if sqlite_comment["pic_url"]:
             pic_url = sqlite_comment["pic_url"]
 
-            # 评论图片目录：weibo/<用户目录>/<用户昵称>_comments_img
+            # 评论图片目录：weibo/<task_id>/<用户目录>/comments_img
             csv_path = self.get_filepath("csv")
             user_dir = os.path.dirname(csv_path)
             if not os.path.isdir(user_dir):
@@ -2346,7 +2346,7 @@ class Weibo(object):
                 self.user_config.get("user_id", "")
             )
             safe_screen_name = re.sub(r'[\\/:*?"<>|]', "_", str(screen_name))
-            pic_path = os.path.join(user_dir, f"{safe_screen_name}_comments_img")
+            pic_path = os.path.join(user_dir, "comments_img")
             if not os.path.exists(pic_path):
                 os.makedirs(pic_path)
 
