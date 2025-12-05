@@ -3044,6 +3044,21 @@ def get_current_status():
 @app.route('/weibos', methods=['GET'])
 def get_weibos():
     try:
+        # 从 config.json 中解析目标用户 ID 列表，用于过滤微博列表只展示“配置的目标用户”
+        try:
+            cfg = load_config_from_file()
+        except SystemExit:
+            cfg = {}
+        except Exception:
+            cfg = {}
+        allowed_user_ids: list[str] = []
+        if isinstance(cfg, dict):
+            try:
+                allowed_user_ids = _extract_user_ids_from_config(cfg)
+            except Exception as _uid_err:
+                logger.warning("解析 config.json 中的 user_id_list 失败，将展示全部微博: %s", _uid_err)
+        allowed_user_ids = [uid for uid in allowed_user_ids if uid]
+
         conn = sqlite3.connect(DATABASE_PATH)
         cursor = conn.cursor()
 
@@ -3057,7 +3072,13 @@ def get_weibos():
             page_size = 10
 
             # 统计总数
-            cursor.execute("SELECT COUNT(*) FROM weibo")
+            if allowed_user_ids:
+                placeholders = ",".join("?" * len(allowed_user_ids))
+                sql_count = f"SELECT COUNT(*) FROM weibo WHERE user_id IN ({placeholders})"
+                cursor.execute(sql_count, tuple(allowed_user_ids))
+            else:
+                # 若无法解析出有效的目标用户 ID，则回退展示全部微博
+                cursor.execute("SELECT COUNT(*) FROM weibo")
             row = cursor.fetchone()
             total = int(row[0]) if row and row[0] is not None else 0
             total_pages = max(1, (total + page_size - 1) // page_size) if total > 0 else 1
@@ -3065,10 +3086,21 @@ def get_weibos():
                 page = total_pages
 
             offset = (page - 1) * page_size
-            cursor.execute(
-                "SELECT * FROM weibo ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (page_size, offset),
-            )
+            if allowed_user_ids:
+                placeholders = ",".join("?" * len(allowed_user_ids))
+                sql_page = (
+                    f"SELECT * FROM weibo WHERE user_id IN ({placeholders}) "
+                    "ORDER BY created_at DESC LIMIT ? OFFSET ?"
+                )
+                cursor.execute(
+                    sql_page,
+                    tuple(allowed_user_ids) + (page_size, offset),
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM weibo ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (page_size, offset),
+                )
             columns = [column[0] for column in cursor.description] if cursor.description else []
             weibos = []
             for row in cursor.fetchall():
@@ -3095,7 +3127,15 @@ def get_weibos():
             )
 
         # JSON 模式：返回完整列表（保持兼容）
-        cursor.execute("SELECT * FROM weibo ORDER BY created_at DESC")
+        if allowed_user_ids:
+            placeholders = ",".join("?" * len(allowed_user_ids))
+            sql_all = (
+                f"SELECT * FROM weibo WHERE user_id IN ({placeholders}) "
+                "ORDER BY created_at DESC"
+            )
+            cursor.execute(sql_all, tuple(allowed_user_ids))
+        else:
+            cursor.execute("SELECT * FROM weibo ORDER BY created_at DESC")
         columns = [column[0] for column in cursor.description]
         weibos = []
         for row in cursor.fetchall():

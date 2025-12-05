@@ -21,6 +21,9 @@
           {% set text = '' if val is none else val|string %}
           {% if col == 'id' %}
             <td><a href="{{ url_for('get_weibo_detail', weibo_id=text) }}">{{ text }}</a></td>
+          {% elif col == 'retweet_id' and text %}
+            {# retweet_id 可点击跳转到被转发的原微博详情 #}
+            <td><a href="{{ url_for('get_weibo_detail', weibo_id=text) }}">{{ text }}</a></td>
           {% else %}
             {% set short = text if text|length <= 80 else text[:38] ~ '...' ~ text[-39:] %}
             <td{% if text %} title="{{ text }}"{% endif %}>{{ short }}</td>
