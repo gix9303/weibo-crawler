@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -366,34 +367,24 @@ class WeiboPdfExporter:
         - weibo.py 下载图片时的文件名形如：
           20241214_1234567890123456.jpg 或 20241214_1234567890123456_1.jpg
         - 即文件名中倒数第二段（或仅有的第二段）为 weibo_id。
-        - 图片目录结构：
-          * 单任务：weibo/<task_id>/<用户目录>/img/*.jpg
+        - 图片实际目录结构可能为：
+          * 单任务：weibo/<task_id>/<用户目录>/img/原创微博图片/*.jpg 等多级目录
           * 聚合结果：<用户目录>/img/*.jpg
+        - 本方法会在 search_root 下递归扫描所有图片文件，并通过文件名解析 weibo_id，
+          以保证“微博正文的图片”可以插入到对应微博正文下方。
         """
-        img_dirs: List[Path] = []
-        try:
-            # 情况1：聚合结果目录 <用户目录>/img
-            direct_img = search_root / "img"
-            if direct_img.is_dir():
-                img_dirs.append(direct_img)
-
-            # 情况2：任务目录 weibo/<task_id>/<用户目录>/img
-            for child in search_root.iterdir():
-                if not child.is_dir():
-                    continue
-                candidate = child / "img"
-                if candidate.is_dir():
-                    img_dirs.append(candidate)
-        except Exception:
-            # 目录扫描失败时直接返回空索引
-            return {}
-
         exts = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
         index: dict[str, List[Path]] = {}
 
-        for img_dir in img_dirs:
-            try:
-                for p in img_dir.iterdir():
+        # 递归扫描 search_root 下的所有图片文件；跳过评论图片目录 comments_img，
+        # 只索引微博正文图片（文件名中含有微博ID）。
+        try:
+            for root, dirs, files in os.walk(search_root):
+                # 跳过评论图片目录
+                if "comments_img" in root.split(os.sep):
+                    continue
+                for name in files:
+                    p = Path(root) / name
                     if not p.is_file():
                         continue
                     if p.suffix.lower() not in exts:
@@ -402,16 +393,22 @@ class WeiboPdfExporter:
                     parts = stem.split("_")
                     if len(parts) < 2:
                         continue
-                    # 多图：倒数第二段是 weibo_id；单图：最后一段就是 weibo_id
+                    # 多图：优先使用倒数第二段；单图：最后一段就是 weibo_id
+                    candidate_ids = []
                     if len(parts) >= 3:
-                        weibo_id = parts[-2]
-                    else:
-                        weibo_id = parts[-1]
-                    if not weibo_id.isdigit():
+                        candidate_ids.append(parts[-2])
+                    candidate_ids.append(parts[-1])
+                    weibo_id = None
+                    for cid in candidate_ids:
+                        if cid.isdigit():
+                            weibo_id = cid
+                            break
+                    if not weibo_id:
                         continue
                     index.setdefault(weibo_id, []).append(p)
-            except Exception:
-                continue
+        except Exception:
+            # 目录扫描失败时直接返回空索引
+            return {}
 
         # 确保每个微博ID下的图片按文件名排序，避免顺序抖动
         for wid, paths in index.items():
