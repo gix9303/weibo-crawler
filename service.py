@@ -588,6 +588,8 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
     weibo_root = os.path.join(base_dir, "weibo")
     dest_zip_path = _get_schedule_cache_zip_path(schedule_id)
 
+    logger.info("开始预生成定时任务 %s 的聚合结果...", schedule_id)
+
     # 1) 聚合该 schedule 下的所有任务的 user_id_list，形成用户 ID 集合
     conn = None
     try:
@@ -632,6 +634,9 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
         if conn:
             conn = None
 
+    user_count = len(user_ids)
+    logger.info("定时任务 %s 聚合阶段：共解析到 %d 个用户需要汇总", schedule_id, user_count)
+
     if not user_ids:
         logger.info("定时任务 %s 下未找到任何用户信息，跳过聚合结果预生成", schedule_id)
         # 若之前存在旧缓存，可选择删除；这里保留不动。
@@ -671,10 +676,18 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
     except Exception as e:
         logger.warning("预生成定时任务 %s 聚合结果时查询任务ID列表失败: %s", schedule_id, e)
 
+    logger.info(
+        "定时任务 %s 聚合阶段：共 %d 个任务参与汇总",
+        schedule_id,
+        len(task_ids),
+    )
+
     # 5) 为每个用户导出聚合微博 / 评论 CSV 和 PDF，并汇总图片/视频到该用户目录
     exported_any = False
+    processed_users = 0
     try:
-        for uid in sorted(user_ids):
+        total_users = len(user_ids)
+        for idx, uid in enumerate(sorted(user_ids), start=1):
             if not uid:
                 continue
 
@@ -691,6 +704,15 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
 
             user_dir = os.path.join(agg_root, safe_nick)
             os.makedirs(user_dir, exist_ok=True)
+
+            logger.info(
+                "定时任务 %s 聚合进度：用户 %d/%d（id=%s，昵称=%s）- 开始导出微博/评论/PDF 与媒体",
+                schedule_id,
+                idx,
+                total_users,
+                uid,
+                safe_nick,
+            )
 
             # 导出所有微博
             try:
@@ -837,6 +859,16 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
                 )
 
             exported_any = exported_any or bool(weibo_rows or comment_rows)
+            processed_users += 1
+            logger.info(
+                "定时任务 %s 聚合进度：用户 %d/%d（%s）处理完成，微博记录数=%d，评论记录数=%d",
+                schedule_id,
+                idx,
+                total_users,
+                safe_nick,
+                len(weibo_rows) if 'weibo_rows' in locals() and weibo_rows else 0,
+                len(comment_rows) if 'comment_rows' in locals() and comment_rows else 0,
+            )
     finally:
         try:
             conn.close()
