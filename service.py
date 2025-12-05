@@ -944,7 +944,7 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
         # 聚合结果就绪时发送 PushDeer 通知，提示用户“现在可以下载”
         try:
             if const.NOTIFY.get("NOTIFY"):
-                # 尝试解析当前配置中的用户昵称列表，构造更友好的提示
+                # 解析当前配置中的用户昵称列表，构造仅包含昵称信息的提示
                 try:
                     cfg = load_config_from_file()
                 except SystemExit:
@@ -954,10 +954,7 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
                 name_str = ""
                 if isinstance(cfg, dict):
                     name_str = _resolve_user_names_for_notification(cfg) or ""
-                if name_str:
-                    msg = f"定时任务 {schedule_id} 的聚合结果已生成，可下载用户：{name_str}"
-                else:
-                    msg = f"定时任务 {schedule_id} 的聚合结果已生成，可下载"
+                msg = f"定时任务 {schedule_id} 的聚合结果已生成，可下载用户：{name_str}"
                 push_deer(msg)
         except Exception as notify_err:
             logger.warning("发送定时任务 %s 聚合结果就绪通知失败: %s", schedule_id, notify_err)
@@ -1027,6 +1024,112 @@ def _build_task_weibo_zip_cache(task: dict) -> None:
         logger.warning("预生成任务 %s 的单任务 zip 失败: %s", task_id, e)
 
 
+def _notify_prebuild_failure(kind: str, identifier: str) -> None:
+    """
+    在预聚合/打包重试失败后发送 PushDeer 通知。
+    kind: 'schedule' 或 'task'
+    identifier: schedule_id 或 task_id
+    """
+    try:
+        if not const.NOTIFY.get("NOTIFY"):
+            return
+        try:
+            cfg = load_config_from_file()
+        except SystemExit:
+            cfg = {}
+        except Exception:
+            cfg = {}
+        name_str = ""
+        if isinstance(cfg, dict):
+            name_str = _resolve_user_names_for_notification(cfg) or ""
+
+        if kind == "schedule":
+            msg = f"定时任务 {identifier} 的聚合结果预生成失败，用户：{name_str}，请检查服务器日志"
+        else:
+            msg = f"微博爬虫任务 {identifier} 的结果打包失败，用户：{name_str}，请检查服务器日志"
+        push_deer(msg)
+    except Exception as notify_err:
+        logger.warning("发送预聚合失败通知时出错: %s", notify_err)
+
+
+def _prebuild_schedule_results_with_retry(schedule_id: str, max_retries: int = 3) -> bool:
+    """
+    对定时任务的聚合预生成做最多 max_retries 次重试：
+    - 每次调用 _build_schedule_results_cache；
+    - 若聚合 zip 出现则视为成功；
+    - 全部失败则记录日志并发送 PushDeer 通知。
+    """
+    cache_zip_path = _get_schedule_cache_zip_path(str(schedule_id))
+    for attempt in range(1, max_retries + 1):
+        try:
+            _build_schedule_results_cache(schedule_id)
+        except Exception as e:
+            logger.warning(
+                "预生成定时任务 %s 聚合结果失败（第 %d/%d 次尝试）: %s",
+                schedule_id,
+                attempt,
+                max_retries,
+                e,
+            )
+        # 无论是否抛异常，只要 zip 文件已经生成，就认为本轮预聚合成功
+        if os.path.isfile(cache_zip_path):
+            logger.info(
+                "定时任务 %s 聚合结果预生成成功（第 %d 次尝试）", schedule_id, attempt
+            )
+            return True
+        if attempt < max_retries:
+            time.sleep(2)
+
+    # 多次尝试后仍未生成 zip，视为预聚合失败
+    logger.warning(
+        "定时任务 %s 聚合结果预生成在重试 %d 次后仍未成功，将发送失败通知",
+        schedule_id,
+        max_retries,
+    )
+    _notify_prebuild_failure("schedule", str(schedule_id))
+    return False
+
+
+def _prebuild_task_zip_with_retry(task: dict, max_retries: int = 3) -> bool:
+    """
+    对单任务 zip 预生成做最多 max_retries 次重试：
+    - 仅针对有微博数据的任务在外层调用；
+    - 若 zip 出现则视为成功；
+    - 全部失败则记录日志并发送 PushDeer 通知。
+    """
+    task_id = str(task.get("task_id") or "").strip()
+    if not task_id:
+        return False
+
+    cache_zip_path = _get_task_cache_zip_path(task_id)
+    for attempt in range(1, max_retries + 1):
+        try:
+            _build_task_weibo_zip_cache(task)
+        except Exception as e:
+            logger.warning(
+                "预生成任务 %s 的单任务 zip 失败（第 %d/%d 次尝试）: %s",
+                task_id,
+                attempt,
+                max_retries,
+                e,
+            )
+        if os.path.isfile(cache_zip_path):
+            logger.info(
+                "任务 %s 的单任务 zip 预生成成功（第 %d 次尝试）", task_id, attempt
+            )
+            return True
+        if attempt < max_retries:
+            time.sleep(2)
+
+    logger.warning(
+        "任务 %s 的单任务 zip 预生成在重试 %d 次后仍未成功，将发送失败通知",
+        task_id,
+        max_retries,
+    )
+    _notify_prebuild_failure("task", task_id)
+    return False
+
+
 def _prebuild_schedule_results_if_needed(task: dict) -> None:
     """
     在子任务/父任务执行完毕后，根据任务信息决定是否预构建定时任务的聚合 zip：
@@ -1063,9 +1166,9 @@ def _prebuild_schedule_results_if_needed(task: dict) -> None:
         return
 
     try:
-        _build_schedule_results_cache(schedule_id)
+        _prebuild_schedule_results_with_retry(schedule_id)
     except Exception as e:
-        logger.warning("预生成定时任务 %s 聚合结果异常: %s", schedule_id, e)
+        logger.warning("预生成定时任务 %s 聚合结果重试逻辑异常: %s", schedule_id, e)
 
 
 def _resolve_user_names_for_notification(config: dict) -> str:
@@ -1443,7 +1546,7 @@ def run_refresh_task(task_id, user_id_list=None):
                 _prebuild_schedule_results_if_needed(fresh_task)
                 # 所有成功任务（普通任务 + 父/子任务）：预生成各自的单任务 zip
                 if _task_has_weibo_data(fresh_task):
-                    _build_task_weibo_zip_cache(fresh_task)
+                    _prebuild_task_zip_with_retry(fresh_task)
         except Exception as pre_err:
             logger.warning("任务 %s 完成后预生成下载缓存失败: %s", task_id, pre_err)
 
@@ -2000,11 +2103,8 @@ def download_task_weibo(task_id):
     if os.path.isfile(cache_zip_path):
         zip_path = cache_zip_path
     else:
-        # 现场生成单任务 zip（包含 sqlite 快照），与预生成逻辑保持一致
-        try:
-            _build_task_weibo_zip_cache(task)
-        except Exception as build_err:
-            logger.warning("任务 %s 现场预生成单任务 zip 失败: %s", task_id, build_err)
+        # 现场生成单任务 zip（包含 sqlite 快照），与预生成逻辑保持一致，并做最多 3 次重试
+        _prebuild_task_zip_with_retry(task)
         if os.path.isfile(cache_zip_path):
             zip_path = cache_zip_path
         else:
