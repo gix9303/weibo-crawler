@@ -778,17 +778,6 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
                     for r in comment_rows:
                         writer.writerow([r[h] for h in headers])
 
-            # 导出 PDF（聚合所有微博+评论）
-            try:
-                db_path = Path(DATABASE_PATH)
-                pdf_exporter = WeiboPdfExporter(db_path=db_path)
-                pdf_exporter.export_user_timeline(
-                    user_id=str(uid),
-                    output_path=os.path.join(user_dir, f"{safe_nick}_all.pdf"),
-                )
-            except Exception as e:
-                logger.warning("预生成定时任务 %s 时为用户 %s 导出聚合 PDF 失败: %s", schedule_id, uid, e)
-
             # 汇总该用户在各个任务中的图片/视频到 <用户目录>/img、video、live_photo 下，
             # 同时汇总评论图片到 <用户目录>/comments_img 下。
             try:
@@ -894,6 +883,17 @@ def _build_schedule_results_cache(schedule_id: str) -> None:
                     uid,
                     e,
                 )
+
+            # 汇总完文件后再导出 PDF，确保微博正文图片可被扫描并嵌入
+            try:
+                db_path = Path(DATABASE_PATH)
+                pdf_exporter = WeiboPdfExporter(db_path=db_path)
+                pdf_exporter.export_user_timeline(
+                    user_id=str(uid),
+                    output_path=os.path.join(user_dir, f"{safe_nick}_all.pdf"),
+                )
+            except Exception as e:
+                logger.warning("预生成定时任务 %s 时为用户 %s 导出聚合 PDF 失败: %s", schedule_id, uid, e)
 
             exported_any = exported_any or bool(weibo_rows or comment_rows)
             processed_users += 1
