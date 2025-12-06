@@ -834,12 +834,54 @@ class Weibo(object):
         sys.exit("超过最大重试次数，程序已退出。")
 
     def get_long_weibo(self, id):
-        """获取长微博"""
-        url = "https://m.weibo.cn/detail/%s" % id
-        logger.info(f"""URL: {url} """)
-        for i in range(5):
+        """获取长微博（优先调用 API，回退 HTML 解析）"""
+        show_url = f"https://m.weibo.cn/statuses/show?id={id}"
+        extend_url = f"https://m.weibo.cn/statuses/extend?id={id}"
+        for _ in range(5):
             sleep(random.uniform(1.0, 2.5))
-            html = self.session.get(url, headers=self.headers, verify=False).text
+            long_text = ""
+            # 先尝试长文接口，获取完整正文
+            try:
+                ext_resp = self.session.get(
+                    extend_url, headers=self.headers, verify=False, timeout=10
+                )
+                ext_json = ext_resp.json()
+                if ext_json.get("ok") == 1:
+                    long_text = (ext_json.get("data") or {}).get("longTextContent", "")
+            except (RequestException, ValueError):
+                logger.debug("获取长文扩展失败 id=%s", id, exc_info=True)
+
+            # 主体接口，返回完整微博结构
+            try:
+                resp = self.session.get(
+                    show_url, headers=self.headers, verify=False, timeout=10
+                )
+                js = resp.json()
+                if js.get("ok") != 1:
+                    continue
+                weibo_info = js.get("data") or js.get("status")
+                if not weibo_info:
+                    continue
+                if long_text:
+                    weibo_info["text"] = long_text
+                    weibo_info["isLongText"] = False
+                else:
+                    long_text_embed = (
+                        (weibo_info.get("longText") or {}).get("longTextContent")
+                        if isinstance(weibo_info.get("longText"), dict)
+                        else ""
+                    )
+                    if long_text_embed:
+                        weibo_info["text"] = long_text_embed
+                return self.parse_weibo(weibo_info)
+            except (RequestException, ValueError):
+                logger.debug("长微博 JSON 解析失败 id=%s", id, exc_info=True)
+
+        # 兜底：使用 detail 页 HTML 结构解析
+        url = "https://m.weibo.cn/detail/%s" % id
+        logger.info(f"Fallback detail URL: {url}")
+        try:
+            html = self.session.get(url, headers=self.headers, verify=False, timeout=10).text
             html = html[html.find('"status":') :]
             html = html[: html.rfind('"call"')]
             html = html[: html.rfind(",")]
@@ -847,8 +889,9 @@ class Weibo(object):
             js = json.loads(html, strict=False)
             weibo_info = js.get("status")
             if weibo_info:
-                weibo = self.parse_weibo(weibo_info)
-                return weibo
+                return self.parse_weibo(weibo_info)
+        except (RequestException, ValueError):
+            logger.debug("长微博 detail 解析失败 id=%s", id, exc_info=True)
 
     def get_pics(self, weibo_info):
         """获取微博原始图片url"""
@@ -1240,6 +1283,19 @@ class Weibo(object):
                 )
         return weibo
 
+    def _has_truncation_hint(self, text_body: str) -> bool:
+        """检测正文里是否包含“...全文/全部”等截断提示"""
+        if not text_body:
+            return False
+        return ("全文" in text_body or "全部" in text_body) and (
+            "...全文" in text_body
+            or "…全文" in text_body
+            or "...全部" in text_body
+            or "…全部" in text_body
+            or ">全文<" in text_body
+            or ">全部<" in text_body
+        )
+
     def parse_weibo(self, weibo_info):
         weibo = OrderedDict()
         if weibo_info["user"]:
@@ -1346,12 +1402,15 @@ class Weibo(object):
             weibo_info = info["mblog"]
             weibo_id = weibo_info["id"]
             retweeted_status = weibo_info.get("retweeted_status")
+            text_body = weibo_info.get("text", "")
             is_long = (
-                True if weibo_info.get("pic_num") > 9 else weibo_info.get("isLongText")
-            )
+                True if weibo_info.get("pic_num", 0) > 9 else weibo_info.get("isLongText")
+            ) or self._has_truncation_hint(text_body)
             if retweeted_status and retweeted_status.get("id"):  # 转发
                 retweet_id = retweeted_status.get("id")
-                is_long_retweet = retweeted_status.get("isLongText")
+                is_long_retweet = retweeted_status.get("isLongText") or self._has_truncation_hint(
+                    retweeted_status.get("text", "")
+                )
                 if is_long:
                     weibo = self.get_long_weibo(weibo_id)
                     if not weibo:
