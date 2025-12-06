@@ -70,11 +70,23 @@ class Comment:
 
 
 @dataclass
+class RetweetPost:
+    id: str
+    created_at: datetime
+    text: str
+    screen_name: str
+    pics: List[str]
+
+
+@dataclass
 class WeiboPost:
     id: str
     created_at: datetime
     text: str
+    screen_name: str
+    pics: List[str]
     comments: List[Comment]
+    retweet: Optional[RetweetPost] = None
 
 
 class WeiboPdfExporter:
@@ -293,7 +305,7 @@ class WeiboPdfExporter:
         # created_at is stored as "YYYY-MM-DD HH:MM:SS"
         cur.execute(
             """
-            SELECT id, text, created_at
+            SELECT id, text, created_at, pics, retweet_id, screen_name
             FROM weibo
             WHERE user_id = ?
             ORDER BY datetime(created_at) DESC
@@ -306,15 +318,47 @@ class WeiboPdfExporter:
         for row in weibo_rows:
             created_at = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
             comments = self._load_comments_for_weibo(conn, row["id"])
+
+            retweet_obj: Optional[RetweetPost] = None
+            retweet_id = (row["retweet_id"] or "").strip()
+            if retweet_id:
+                retweet_obj = self._load_retweet(conn, retweet_id)
+
             weibos.append(
                 WeiboPost(
                     id=row["id"],
                     created_at=created_at,
                     text=row["text"] or "",
+                    screen_name=row["screen_name"] or "",
+                    pics=self._split_pics(row["pics"]),
                     comments=comments,
+                    retweet=retweet_obj,
                 )
             )
         return weibos
+
+    def _load_retweet(self, conn: sqlite3.Connection, retweet_id: str) -> Optional[RetweetPost]:
+        """加载被转发的原微博信息（正文 + 图片）"""
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, text, created_at, pics, screen_name
+            FROM weibo
+            WHERE id = ?
+            """,
+            (retweet_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        created_at = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
+        return RetweetPost(
+            id=row["id"],
+            created_at=created_at,
+            text=row["text"] or "",
+            screen_name=row["screen_name"] or "",
+            pics=self._split_pics(row["pics"]),
+        )
 
     def _load_comments_for_weibo(
         self, conn: sqlite3.Connection, weibo_id: str
@@ -418,6 +462,15 @@ class WeiboPdfExporter:
         return index
 
     @staticmethod
+    def _split_pics(pics_raw: Optional[str]) -> List[str]:
+        """将逗号分隔的图片 URL 转成列表；空值返回空列表"""
+        if not pics_raw:
+            return []
+        if isinstance(pics_raw, str):
+            return [p for p in pics_raw.split(",") if p]
+        return []
+
+    @staticmethod
     def _parse_comment_time(raw: str) -> Optional[datetime]:
         """
         Parse comment created_at string from SQLite.
@@ -500,21 +553,20 @@ class WeiboPdfExporter:
                 )
                 elements.append(Spacer(1, 2 * mm))
 
-            # 如果本地有与该微博ID对应的图片文件，则将图片插入到正文下方
-            img_paths = image_index.get(post.id) or []
-            for img_path in img_paths:
-                try:
-                    img = RLImage(str(img_path))
-                    # 超宽图片按页面宽度等比缩放
-                    if img.drawWidth > max_width:
-                        factor = float(max_width) / float(img.drawWidth or max_width)
-                        img.drawWidth = max_width
-                        img.drawHeight = img.drawHeight * factor
-                    elements.append(img)
-                    elements.append(Spacer(1, 2 * mm))
-                except Exception:
-                    # 单张图片出问题时忽略，继续生成其它内容
-                    continue
+            self._append_images_for_post(post.id, image_index, elements, max_width)
+
+            # 若为转发微博，追加被转发的原微博正文与图片
+            if post.retweet:
+                rt = post.retweet
+                rt_header = f"转发自 {rt.screen_name or '原微博'}（ID: {rt.id}，时间: {rt.created_at.strftime('%Y-%m-%d %H:%M:%S')}）"
+                elements.append(Paragraph(escape(rt_header), styles["retweet_header"]))
+                elements.append(Spacer(1, 1 * mm))
+                if rt.text:
+                    elements.append(
+                        Paragraph(escape(rt.text).replace("\n", "<br/>"), styles["retweet_body"])
+                    )
+                    elements.append(Spacer(1, 1.5 * mm))
+                self._append_images_for_post(rt.id, image_index, elements, max_width)
 
             if post.comments:
                 elements.append(Paragraph("评论：", styles["comment_header"]))
@@ -534,6 +586,25 @@ class WeiboPdfExporter:
             elements.append(Spacer(1, 4 * mm))
 
         doc.build(elements)
+
+    def _append_images_for_post(
+        self, post_id: str, image_index: dict[str, List[Path]], elements: List[object], max_width: float
+    ) -> None:
+        """将某条微博（或转发微博）的正文图片追加到 PDF 元素列表中"""
+        img_paths = image_index.get(post_id) or []
+        for img_path in img_paths:
+            try:
+                img = RLImage(str(img_path))
+                # 超宽图片按页面宽度等比缩放
+                if img.drawWidth > max_width:
+                    factor = float(max_width) / float(img.drawWidth or max_width)
+                    img.drawWidth = max_width
+                    img.drawHeight = img.drawHeight * factor
+                elements.append(img)
+                elements.append(Spacer(1, 2 * mm))
+            except Exception:
+                # 单张图片出问题时忽略，继续生成其它内容
+                continue
 
     def _init_styles(self, font_path: Optional[Path | str]) -> dict:
         styles = getSampleStyleSheet()
@@ -601,6 +672,26 @@ class WeiboPdfExporter:
                 leading=12,
             )
         )
+        styles.add(
+            ParagraphStyle(
+                name="RetweetHeader",
+                parent=styles["Normal"],
+                fontName=base_font,
+                fontSize=10,
+                leading=13,
+                textColor="#555555",
+            )
+        )
+        styles.add(
+            ParagraphStyle(
+                name="RetweetBody",
+                parent=styles["Normal"],
+                fontName=base_font,
+                fontSize=10,
+                leading=13,
+                textColor="#444444",
+            )
+        )
 
         return {
             "title": styles["WeiboTitle"],
@@ -615,6 +706,8 @@ class WeiboPdfExporter:
                 fontSize=11,
                 leading=14,
             ),
+            "retweet_header": styles["RetweetHeader"],
+            "retweet_body": styles["RetweetBody"],
         }
 
 
